@@ -6,14 +6,13 @@
 ## FILE STRUCTURE
 ```
 homeplanet/
-├── main.c      ← Game loop, state machine, 3D base, interaction glue
-├── world.h     ← Tile types, world gen, conveyor belts, auto-miners,
-│                  blueprint system, save/load, bandwidth mesh calc
-├── player.h    ← ItemStack inventory, crafting recipes, hotbar, movement
-├── ui.h        ← Top HUD, bottom hotbar, crafting menu, comms log,
-│                  blueprint terminal UI
-└── Makefile    ← Build script
-```
+├── README.md            # Project documentation (seen in your screenshot)
+├── .vscode/             # Editor settings (tasks.json, launch.json)
+└── src/                 # All source code lives here
+    ├── main.c           # Entry point: Game loop & State Machine
+    ├── world.h          # World Gen, Tile Logic, Conveyors, Blueprints
+    ├── player.h         # Inventory, Recipes, Movement
+    └── ui.h             # HUD, Menus, Comms Log
 
 ---
 
