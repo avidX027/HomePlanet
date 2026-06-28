@@ -1,5 +1,5 @@
 # HOME PLANET: VOID RUNNER v2.0
-## A 2D/3D Hybrid Factory & Networking Sandbox
+## A 2D Online Strategic Factory Survival Game
 
 ---
 
@@ -26,74 +26,99 @@ gcc -std=c99 -O2 main.c -o homeplanet -lraylib -lm
 ./homeplanet
 ```
 
+Ideas
+2D game, Sliced 3D
+
 ---
 
 ## CONTROLS
 
-### Surface (2D)
+Movement and interaction
 | Key | Action |
 |-----|--------|
 | WASD | Move |
+| E | Interact |
 | Left Click | Mine tile |
 | Right Click | Place selected hotbar tile |
-| 1–9 | Select hotbar slot |
+
+UI
+| 1–8 | Select hotbar slot |
 | Mouse Wheel | Scroll hotbar |
 | TAB | Open/close Crafting Terminal |
 | ↑↓ (in craft menu) | Navigate recipes |
 | ENTER (in craft menu) | Craft item |
-| B | Open/close Blueprint Terminal |
-| C (in blueprint) | Capture 5×5 blueprint around you |
-| P (in blueprint) | Paste blueprint at your position |
-| E (on Rocket Pad) | Enter 3D Base |
+
+Menu
 | F5 | Save world to disk |
 | F9 | Load world from disk |
 | ESC | Pause menu |
 | F11 | Toggle fullscreen |
 
-### 3D Base
-| Key | Action |
-|-----|--------|
-| Mouse (orbital) | Rotate camera |
-| 1–4 | Select component type |
-| SPACE | Place selected component |
-| ESC | Exit back to surface |
-
 ---
 
 ## ITEMS & CRAFTING
 
+energy and resourse extraction
+smelting
+bioengineered plants - terraforming - mining
+electronics, circuits, 
+pnematics
+plumbing
+plastics raw
+
+
 | Output | Input A | Input B |
 |--------|---------|---------|
-| Electronics (1) | Wood ×3 | Stone ×2 |
-| Circuit (1) | Electronics ×2 | — |
-| Cable (2) | Wood ×2 | Electronics ×1 |
-| Antenna (1) | Circuit ×1 | Stone ×3 |
-| Ping Core (1) | Antenna ×1 | Circuit ×2 |
+Ores Iron Copper Gold aluminum
+
+Refinery rubber oil
+
+| Electronics |  |  |
+| Circuit | Electronics  | — |
+| Cable | Copper | Rubber |
+
 
 ---
 
 ## HOTBAR DEFAULTS
-1. Ping Tower (costs 20 Wood)
-2. Conveyor ↑ (costs 5 Wood)
-3. Conveyor ↓ (costs 5 Wood)
-4. Conveyor → (costs 5 Wood)
-5. Conveyor ← (costs 5 Wood)
-6. Auto-Miner (costs 20 Stone)
-7. Chest (costs 10 Wood)
-8. Dirt
-9. Dirt
+
+1. steam and gas Engines
+2. motors small med large, platic for fans and metal for steppers
+3. compressors, heat exchangers, 
+4. energy storage
+5. Conveyor
+6. pipes
+7. Auto-Miner types and integrated systems
+8. Chests shelves and bins
+9. 3d printer
+10. extruded metal
+11. bearing gears motors and mechanical building blocks are components not interactable items, motors are like subcomponents of placable objects
+12. laser modules small med large, this is where the scaled crafting system shines, youll see that when you add more to the craft, that you get a more robust and powerful item
+13. 
+14. 
 
 ---
 
-## 3D BASE COMPONENTS
+
+## BASE COMPONENTS
 | # | Component | Cost |
 |---|-----------|------|
-| 1 | Server Unit | Electronics ×3 |
-| 2 | Cooling Fan | Stone ×5 |
-| 3 | Antenna Dish | Antenna ×1 |
-| 4 | Cable Rack | Cable ×2 |
+1. Computer
+2. server
+3. Antenna Dish
+4. Cooling system made from a bp researched by analysing a toredown abandond ac
+5. Satellite
+6. Rocket S M L
+7. 
 
-> **Heat Warning:** Each Server adds 10°C. Each Cooling Fan removes 8°C.
+
+
+ Computers and networks research & unlock new items
+ theres is wind and dust outside
+ warehouseing your compute is reccomended
+ otherwise youll have to maintain dust filters and put up turrets to prevent destruction and scare theives
+ cameras work as agents, observers that indicate of anomolies
+> **Heat Warning:** Each Server adds x°C. Each Cooling Fan removes y°C.
 > Keep heat below 30°C for stable operation!
 
 ---
@@ -103,19 +128,24 @@ gcc -std=c99 -O2 main.c -o homeplanet -lraylib -lm
 | Game Mechanic | Real Concept |
 |---------------|-------------|
 | Bandwidth bar | Network throughput — how much data flows per second |
-| Ping Towers | Meshtastic/LoRa mesh nodes — signal relay devices |
+| Signal Strength | dbm |
 | Mesh signal Hz | Radio frequency — the channel your nodes talk on |
-| Conveyor belt speed scaling with bandwidth | QoS (Quality of Service) — faster network = faster throughput |
-| Auto-Miner daemon | Background process / daemon — runs without player input |
-| Blueprint code string | Serialisation — converting a structure into shareable data |
+| Mhz | Radio Frequenzy for local coms modules |
+| Ghz | Computation speed |
+| Radio Towers | Meshtastic/LoRa mesh nodes — signal relay devices 
+| Conveyor |  |
 | Save/Load (F5/F9) | Persistence — writing state to disk, reading it back |
 | Crafting recipe lookup | Lookup table / hash map — input keys map to output values |
 | 3D Base heat management | Data center cooling — real servers need thermal management |
 | Comms Log messages | System log / stdout — how programs report internal events |
+BLUE COLLAR TRADES
+
 
 ---
 
 ## NEXT EXPANSION IDEAS
+
+
 1. **Multiplayer Packets**: Fake network "peers" that trade items via simulated UDP
 2. **Power Grid**: Solar panels → capacitors → machines (teaches voltage/current)
 3. **Signal Encryption**: Antenna dish + Ping Core = encrypted mesh channel
