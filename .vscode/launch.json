@@ -5,9 +5,15 @@
             "name": "Launch Game",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/HomePlanet.exe",
             "cwd": "${workspaceFolder}",
-            "preLaunchTask": "Build"
+            "preLaunchTask": "Build",
+            "program": "${workspaceFolder}/bin/HomePlanet",
+            "MIMode": "lldb",
+            "windows": {
+                "program": "${workspaceFolder}/bin/HomePlanet.exe",
+                "MIMode": "gdb",
+                "miDebuggerPath": "C:/msys64/ucrt64/bin/gdb.exe"
+            }
         }
     ]
 }

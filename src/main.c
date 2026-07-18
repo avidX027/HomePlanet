@@ -1,5 +1,5 @@
 // ============================================================
-//  HOME PLANET: VOID RUNNER — MAIN
+//  HOME PLANET: VOID RUNNER — MAIN - Version 1.0
 // ============================================================
 
 #include "raylib.h"
@@ -358,7 +358,7 @@ void DrawHomePlanet(void) {
                 DrawText("[E] ENTER BASE", (int)player.pos.x - 80, (int)player.pos.y - 50, 24, WHITE);
         }
 
-        DrawCircleV(player.pos, 20, BLUE);
+        DrawCircleV(player.pos, 20, YELLOW);
         DrawCircleLines((int)player.pos.x, (int)player.pos.y, 22, (Color){0,255,255,255});
 
         HandleMiningAndPlacing(dt);

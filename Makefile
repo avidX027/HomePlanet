@@ -1,31 +1,47 @@
 # ============================================================
-#  HOME PLANET: VOID RUNNER — Windows MinGW Makefile
+#  HOME PLANET: VOID RUNNER — Cross-platform Makefile
 #  Expects:  src/main.c  src/world.h  src/player.h  src/ui.h
-#  Outputs:  bin/HomePlanet.exe
-#  Build:    mingw32-make   (triggered by VS Code tasks.json)
 #
-#  Raylib setup (do this once):
-#    1. Download raylib Windows MinGW build from:
-#       https://github.com/raysan5/raylib/releases
-#    2. Copy raylib.h + libraylib.a into your MinGW:
-#       C:/mingw64/include/   and   C:/mingw64/lib/
+#  Windows (MSYS2 UCRT64):
+#    C:/msys64/ucrt64/bin/mingw32-make.exe   ->  bin/HomePlanet.exe
+#    raylib expected at C:/raylib/include and C:/raylib/lib
+#  macOS:
+#    make                                    ->  bin/HomePlanet
+#    raylib expected at /usr/local (dylib install)
 # ============================================================
 
-CC      = gcc
-CFLAGS  = -std=c99 -O2 -Wall -Wextra -I src
-LIBS    = -lraylib -lopengl32 -lgdi32 -lwinmm -lm
+CFLAGS  = -std=c99 -O2 -g -Wall -Wextra -I src
 SRC     = src/main.c
-OUT     = bin/HomePlanet.exe
+HDRS    = src/world.h src/player.h src/ui.h
 
-all: bin $(OUT)
+ifeq ($(OS),Windows_NT)
+    CC      = C:/msys64/ucrt64/bin/gcc.exe
+    OUT     = bin/HomePlanet.exe
+    CFLAGS += -I C:/raylib/include
+    LIBS    = -L C:/raylib/lib -lraylib -lopengl32 -lgdi32 -lwinmm -lm
+    MKDIR   = if not exist bin mkdir bin
+    RM      = del /Q bin\HomePlanet.exe 2>nul || exit 0
+    RUN     = bin\HomePlanet.exe
+else
+    CC      = clang
+    OUT     = bin/HomePlanet
+    CFLAGS += -I /usr/local/include
+    LIBS    = /usr/local/lib/libraylib.dylib -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo -lm
+    MKDIR   = mkdir -p bin
+    RM      = rm -f bin/HomePlanet
+    RUN     = ./bin/HomePlanet
+endif
 
-bin:
-	mkdir -p bin
+all: $(OUT)
 
-$(OUT): $(SRC) src/world.h src/player.h src/ui.h
+$(OUT): $(SRC) $(HDRS)
+	$(MKDIR)
 	$(CC) $(CFLAGS) $(SRC) -o $(OUT) $(LIBS)
 
-clean:
-	del /Q bin\HomePlanet.exe 2>nul || true
+run: $(OUT)
+	$(RUN)
 
-.PHONY: all clean
+clean:
+	$(RM)
+
+.PHONY: all run clean
