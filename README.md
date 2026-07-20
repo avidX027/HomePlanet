@@ -1,158 +1,138 @@
-# HOME PLANET: VOID RUNNER v2.0
-## A 2D Online Strategic Factory Survival Game
+# HOME PLANET: VOID RUNNER
+### A 2D mining / crafting / building sandbox — and a C learning project
+
+Built with [raylib](https://www.raylib.com/) in plain C99. The codebase is
+deliberately small, heavily commented, and **data-driven**: the goal is to
+learn C by being able to change one thing and see one thing change on screen.
 
 ---
 
-## FILE STRUCTURE
+## PROJECT STRUCTURE
+
 ```
-homeplanet/
-├── README.md            # Project documentation (seen in your screenshot)
-├── .vscode/             # Editor settings (tasks.json, launch.json)
-└── src/                 # All source code lives here
-    ├── main.c           # Entry point: Game loop & State Machine
-    ├── world.h          # World Gen, Tile Logic, Conveyors, Blueprints
-    ├── player.h         # Inventory, Recipes, Movement
-    └── ui.h             # HUD, Menus, Comms Log
+HomePlanet/
+├── README.md
+├── Makefile             # cross-platform build (Mac + Windows)
+├── .vscode/             # tasks.json (build) + launch.json (F5 debug)
+└── src/
+    ├── config.h         # every tweakable number: colors, speeds, sizes
+    ├── gamedata.h       # WHAT exists: the item table + tile table
+    ├── world.h          # the tile grid: generate, draw, damage, save/load
+    ├── player.h         # movement, inventory, crafting, placing
+    ├── ui.h             # hotbar, craft menu, help text (screen space)
+    └── main.c           # game loop + input; the only file where they meet
+```
+
+**The dependency rule:** files may only include files *above* them in this
+list. `world.h` doesn't know players exist; `ui.h` reads state but never
+changes it. That one-way flow is why edits stay isolated.
+
+**The data rule:** every item and tile is ONE ROW in a table in
+`gamedata.h`. Adding or removing an item touches only that file — the
+hotbar, craft menu, mining, and placing all adapt automatically.
 
 ---
 
 ## BUILD & RUN
-```bash
-# Linux/Mac (requires raylib installed)
-make run
 
-# Or manually:
-gcc -std=c99 -O2 main.c -o homeplanet -lraylib -lm
-./homeplanet
+The same commands work on both machines. Clone, build, play:
+
+```bash
+git clone https://github.com/avidX027/HomePlanet.git
+make          # Windows: mingw32-make  (VS Code: Ctrl/Cmd+Shift+B)
+make run      # or ./bin/HomePlanet  /  bin\HomePlanet.exe
 ```
 
-Ideas
-2D game, Sliced 3D
+In VS Code: **Ctrl/Cmd+Shift+B** builds, **F5** builds and debugs.
+(Never use the ▶ "Run C/C++ File" button — it bypasses the Makefile
+and won't link raylib.)
+
+### One-time setup per machine
+
+**macOS** — install raylib to `/usr/local` (e.g. build from source or
+`brew install raylib`), plus Xcode command-line tools.
+
+**Windows (MSYS2 UCRT64)** —
+1. Install [MSYS2](https://www.msys2.org/), then in the MSYS2 shell:
+   `pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-make mingw-w64-ucrt-x86_64-gdb`
+2. Download the raylib MinGW release from
+   [raylib releases](https://github.com/raysan5/raylib/releases) and place
+   headers/libs at `C:/raylib/include` and `C:/raylib/lib`.
 
 ---
 
 ## CONTROLS
 
-Movement and interaction
 | Key | Action |
 |-----|--------|
 | WASD | Move |
-| E | Interact |
-| Left Click | Mine tile |
-| Right Click | Place selected hotbar tile |
-
-UI
-| 1–8 | Select hotbar slot |
-| Mouse Wheel | Scroll hotbar |
-| TAB | Open/close Crafting Terminal |
-| ↑↓ (in craft menu) | Navigate recipes |
-| ENTER (in craft menu) | Craft item |
-
-Menu
-| F5 | Save world to disk |
-| F9 | Load world from disk |
-| ESC | Pause menu |
-| F11 | Toggle fullscreen |
+| Left Click (hold) | Mine tile (pickaxe mines faster than hands) |
+| Right Click | Place selected item (walls, drills, ...) |
+| 1–9 / click hotbar | Select item |
+| TAB | Crafting menu (↑↓ navigate, ENTER craft) |
+| F5 / F9 | Save / load world |
+| ESC | Back to title screen |
+| ENTER | Start (title screen) |
 
 ---
 
-## ITEMS & CRAFTING
+## CURRENT GAME CONTENT
 
-energy and resourse extraction
-smelting
-bioengineered plants - terraforming - mining
-electronics, circuits, 
-pnematics
-plumbing
-plastics raw
+**Tiles:** grass, tree, rock, wall, mushroom, mining drill
+**Items:** wood, stone, pickaxe, wall, mushroom, mining drill
 
+Loop: mine trees/rocks → craft a pickaxe (mine faster) → craft walls and
+drills → build. Everything above is defined in the two tables in
+`gamedata.h` — open it and read the rows.
 
-| Output | Input A | Input B |
-|--------|---------|---------|
-Ores Iron Copper Gold aluminum
+### How to add an item (the whole process)
 
-Refinery rubber oil
-
-| Electronics |  |  |
-| Circuit | Electronics  | — |
-| Cable | Copper | Rubber |
-
+1. Add `ITEM_MYTHING,` to the `ItemID` enum in `gamedata.h`
+2. Add one row to the `ITEMS[]` table (name, color, recipe, ...)
+3. (If it places a tile) add a `TILE_` enum entry + `TILES[]` row
+4. Rebuild. It's now in the hotbar and craft menu.
 
 ---
 
-## HOTBAR DEFAULTS
+## C CONCEPTS THIS CODEBASE TEACHES
 
-1. steam and gas Engines
-2. motors small med large, platic for fans and metal for steppers
-3. compressors, heat exchangers, 
-4. energy storage
-5. Conveyor
-6. pipes
-7. Auto-Miner types and integrated systems
-8. Chests shelves and bins
-9. 3d printer
-10. extruded metal
-11. bearing gears motors and mechanical building blocks are components not interactable items, motors are like subcomponents of placable objects
-12. laser modules small med large, this is where the scaled crafting system shines, youll see that when you add more to the craft, that you get a more robust and powerful item
-13. 
-14. 
+| Where | Concept |
+|-------|---------|
+| config.h | `#define` macros vs variables |
+| gamedata.h | enums, structs, designated initializers, sentinel values |
+| player.h | pointers, `->`, pass-by-address |
+| world.h | 2D arrays, binary file I/O (`fopen`/`fwrite`/`fread`) |
+| ui.h | immediate-mode GUI, single-source-of-truth geometry |
+| main.c | the frame loop, delta time, short-circuit `&&`, scope |
+| Makefile | how C actually builds: compile → link, per-OS libraries |
 
 ---
 
+## VISION / IDEA BACKLOG
 
-## BASE COMPONENTS
-| # | Component | Cost |
-|---|-----------|------|
-1. Computer
-2. server
-3. Antenna Dish
-4. Cooling system made from a bp researched by analysing a toredown abandond ac
-5. Satellite
-6. Rocket S M L
-7. 
+*Brainstorm territory — none of this exists yet. Kept here so it isn't
+lost; promoted to the sections above only when implemented.*
 
+**Industry chain:** ores (iron, copper, gold, aluminum) → smelting →
+electronics/circuits/cables → engines, motors, compressors, pneumatics,
+plumbing, plastics. Scaled crafting: bigger recipes yield more powerful
+versions (laser modules S/M/L). Components (gears, bearings) as
+sub-parts of placeables rather than standalone items.
 
+**Logistics:** conveyors, pipes, auto-miner systems, chests/shelves/bins,
+3D printers, energy storage.
 
- Computers and networks research & unlock new items
- theres is wind and dust outside
- warehouseing your compute is reccomended
- otherwise youll have to maintain dust filters and put up turrets to prevent destruction and scare theives
- cameras work as agents, observers that indicate of anomolies
-> **Heat Warning:** Each Server adds x°C. Each Cooling Fan removes y°C.
-> Keep heat below 30°C for stable operation!
+**Base building:** computers & servers unlock research; heat management
+(servers add heat, cooling removes it); dust and wind outside — filters,
+turrets, cameras as anomaly observers; antenna dishes, satellites,
+rockets S/M/L.
 
----
+**Tech concepts taught in-game:** bandwidth/throughput, signal strength
+(dBm), mesh radio (LoRa/Meshtastic-style relays), MHz vs GHz,
+persistence (already in: F5/F9), lookup tables (already in: recipes),
+data-center cooling, system logs. Blue-collar trades as a theme.
 
-## TECH CONCEPTS TAUGHT IN-GAME
+**Further out:** simulated multiplayer packet trading, power grid
+(solar → capacitors → machines), signal encryption, research tree,
+procedural crater dungeons.
 
-| Game Mechanic | Real Concept |
-|---------------|-------------|
-| Bandwidth bar | Network throughput — how much data flows per second |
-| Signal Strength | dbm |
-| Mesh signal Hz | Radio frequency — the channel your nodes talk on |
-| Mhz | Radio Frequenzy for local coms modules |
-| Ghz | Computation speed |
-| Radio Towers | Meshtastic/LoRa mesh nodes — signal relay devices 
-| Conveyor |  |
-| Save/Load (F5/F9) | Persistence — writing state to disk, reading it back |
-| Crafting recipe lookup | Lookup table / hash map — input keys map to output values |
-| 3D Base heat management | Data center cooling — real servers need thermal management |
-| Comms Log messages | System log / stdout — how programs report internal events |
-BLUE COLLAR TRADES
-
-
----
-
-## NEXT EXPANSION IDEAS
-
-
-1. **Multiplayer Packets**: Fake network "peers" that trade items via simulated UDP
-2. **Power Grid**: Solar panels → capacitors → machines (teaches voltage/current)
-3. **Signal Encryption**: Antenna dish + Ping Core = encrypted mesh channel
-4. **PvP Arena State**: Already wired up in the state machine — just needs content
-5. **Research Tree**: Spend Circuits to unlock new tile types
-6. **Procedural Dungeons**: Enter craters for loot with roguelike rooms
-
----
-
-*Built with [raylib](https://www.raylib.com/) — a simple and easy-to-use C library for games.*
