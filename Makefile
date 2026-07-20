@@ -12,7 +12,9 @@
 
 CFLAGS  = -std=c99 -O2 -g -Wall -Wextra -I src
 SRC     = src/main.c
-HDRS    = src/world.h src/player.h src/ui.h
+# wildcard = "every .h in src/" — add or delete headers freely,
+# the Makefile notices them automatically
+HDRS    = $(wildcard src/*.h)
 
 ifeq ($(OS),Windows_NT)
     CC      = C:/msys64/ucrt64/bin/gcc.exe
