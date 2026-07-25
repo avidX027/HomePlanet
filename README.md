@@ -135,4 +135,3 @@ data-center cooling, system logs. Blue-collar trades as a theme.
 **Further out:** simulated multiplayer packet trading, power grid
 (solar → capacitors → machines), signal encryption, research tree,
 procedural crater dungeons.
-

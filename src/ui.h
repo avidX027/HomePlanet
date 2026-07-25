@@ -211,11 +211,25 @@ static void UiDrawCraftMenu(const Player *p) {
     DrawText("CRAFTING", mx+20, my+15, 32, SKYBLUE);
 
     int row = 0;
+    int visibleRows = 4;
+    int maxRows = 0;
+    for (ItemID id = 1; id < ITEM_COUNT; id++) {
+        if (ITEMS[id].inA != ITEM_NONE) maxRows++;
+    }
+    int startRow = p->craftScroll;
+    int endRow = startRow + visibleRows;
+    if (endRow > maxRows) endRow = maxRows;
+    int current = 0;
     for (ItemID id = 1; id < ITEM_COUNT; id++) {
         if (ITEMS[id].inA == ITEM_NONE) continue;        // not craftable
+        if (current < startRow) {
+            current++;
+            continue;
+        }
+        if (current >= endRow) break;
         const ItemInfo *it = &ITEMS[id];
         int  ry  = my + 70 + row * 64;
-        bool sel = (row == p->craftSel);
+        bool sel = (current == p->craftSel);
         bool ok  = PlayerCanCraft(p, id);
 
         DrawRectangle(mx+12, ry, mw-24, 56,
@@ -233,6 +247,7 @@ static void UiDrawCraftMenu(const Player *p) {
 
         if (sel) DrawText("[ENTER]", mx+mw-110, ry+18, 20, GOLD);
         row++;
+        current++;
     }
     DrawText("[UP/DOWN] select   [ENTER] craft   [TAB] close",
              mx+20, my+mh-32, 18, GRAY);

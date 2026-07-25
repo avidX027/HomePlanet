@@ -45,6 +45,28 @@ static void WorldInit(void) {
     }
 }
 
+static bool WorldTileIsSolid(TileType t) {
+    return t != TILE_GRASS;
+}
+
+static bool WorldPositionWalkable(Vector2 pos) {
+    int minX = (int)((pos.x - PLAYER_RADIUS) / TILE_SIZE);
+    int maxX = (int)((pos.x + PLAYER_RADIUS) / TILE_SIZE);
+    int minY = (int)((pos.y - PLAYER_RADIUS) / TILE_SIZE);
+    int maxY = (int)((pos.y + PLAYER_RADIUS) / TILE_SIZE);
+
+    for (int x = minX; x <= maxX; x++) {
+        for (int y = minY; y <= maxY; y++) {
+            if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_SIZE) continue;
+            if (!WorldTileIsSolid(world[x][y].type)) continue;
+
+            Rectangle tileRect = { x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE };
+            if (CheckCollisionCircleRec(pos, PLAYER_RADIUS, tileRect)) return false;
+        }
+    }
+    return true;
+}
+
 // ─── Change one tile (also resets its health) ─────────────
 static void WorldSetTile(int x, int y, TileType t) {
     if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_SIZE) return;
@@ -72,7 +94,7 @@ static void WorldDraw(void) {
         for (int y = 0; y < WORLD_SIZE; y++) {
             const TileInfo *info = &TILES[world[x][y].type];
             Rectangle r = { (float)(x * TILE_SIZE), (float)(y * TILE_SIZE),
-                            TILE_SIZE - 1.0f, TILE_SIZE - 1.0f };
+                            TILE_SIZE, TILE_SIZE };
             DrawRectangleRec(r, info->color);
 
             // Darken partially-mined tiles so damage is visible.
@@ -82,6 +104,19 @@ static void WorldDraw(void) {
                 DrawRectangleRec(r, (Color){0,0,0,(unsigned char)(missing*160)});
             }
         }
+    }
+
+    Color gridColor = (Color){0, 0, 0, 40};
+    float worldSize = (float)(WORLD_SIZE * TILE_SIZE);
+    for (int x = 1; x < WORLD_SIZE; x++) {
+        Vector2 p1 = { x * TILE_SIZE, 0 };
+        Vector2 p2 = { x * TILE_SIZE, worldSize };
+        DrawLineV(p1, p2, gridColor);
+    }
+    for (int y = 1; y < WORLD_SIZE; y++) {
+        Vector2 p1 = { 0, y * TILE_SIZE };
+        Vector2 p2 = { worldSize, y * TILE_SIZE };
+        DrawLineV(p1, p2, gridColor);
     }
 }
 
@@ -102,6 +137,13 @@ static bool WorldLoad(void) {
     FILE *f = fopen(SAVE_FILE, "rb");
     if (f == NULL) return false;          // no save file yet
     fread(world, sizeof(world), 1, f);
+    fclose(f);
+    return true;
+}
+
+static bool WorldHasSave(void) {
+    FILE *f = fopen(SAVE_FILE, "rb");
+    if (f == NULL) return false;
     fclose(f);
     return true;
 }

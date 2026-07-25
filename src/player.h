@@ -16,6 +16,7 @@
 #include "raymath.h"    // Vector2Add, Vector2Normalize, ...
 #include "config.h"
 #include "gamedata.h"
+#include "world.h"
 
 #define HOTBAR_MAX_SLOTS 7
 #define INVENTORY_COLS 10
@@ -38,6 +39,7 @@ typedef struct {
     int     inventoryDragIndex;
     bool    craftMenuOpen;
     int     craftSel;                  // highlighted row in craft menu
+    int     craftScroll;               // first visible craft row
 } Player;
 
 // ─── Init ─────────────────────────────────────────────────
@@ -63,6 +65,7 @@ static void PlayerInit(Player *p) {
     p->inventoryDragIndex = -1;
     p->craftMenuOpen = false;
     p->craftSel      = 0;
+    p->craftScroll   = 0;
 }
 
 static void PlayerSelectSlot(Player *p, int slot) {
@@ -107,7 +110,6 @@ static void PlayerEnsureHotbarContains(Player *p, ItemID id) {
     if (id == ITEM_NONE) return;
     for (int i = 0; i < HOTBAR_MAX_SLOTS; i++) {
         if (p->inventorySlots[i] == id && p->inventoryAmounts[i] > 0) {
-            PlayerSelectSlot(p, i);
             return;
         }
     }
@@ -115,7 +117,6 @@ static void PlayerEnsureHotbarContains(Player *p, ItemID id) {
         if (p->inventorySlots[i] == ITEM_NONE || p->inventoryAmounts[i] <= 0) {
             p->inventorySlots[i] = id;
             p->inventoryAmounts[i] = 0;
-            PlayerSelectSlot(p, i);
             return;
         }
     }
@@ -199,8 +200,16 @@ static void PlayerMove(Player *p, float dt) {
     // Normalize so diagonal movement isn't faster (length 1.41 -> 1).
     // Multiply by dt so speed is per-SECOND, independent of framerate.
     if (dir.x != 0 || dir.y != 0) {
-        dir    = Vector2Normalize(dir);
-        p->pos = Vector2Add(p->pos, Vector2Scale(dir, PLAYER_SPEED * dt));
+        dir = Vector2Normalize(dir);
+        Vector2 nextPosX = Vector2Add(p->pos, Vector2Scale((Vector2){dir.x, 0}, PLAYER_SPEED * dt));
+        Vector2 nextPosY = Vector2Add(p->pos, Vector2Scale((Vector2){0, dir.y}, PLAYER_SPEED * dt));
+
+        if (WorldPositionWalkable(nextPosX)) {
+            p->pos.x = nextPosX.x;
+        }
+        if (WorldPositionWalkable(nextPosY)) {
+            p->pos.y = nextPosY.y;
+        }
     }
 
     float max = (WORLD_SIZE * TILE_SIZE) - PLAYER_RADIUS;
@@ -228,12 +237,21 @@ static float PlayerMiningDPS(const Player *p) {
 // ─── Crafting ─────────────────────────────────────────────
 // All recipe data comes from the ITEMS table — these functions
 // would not change if you added 50 new items.
+static bool PlayerIsTool(ItemID id) {
+    return id == ITEM_FURNACE;
+}
+
 static bool PlayerCanCraft(const Player *p, ItemID id) {
     const ItemInfo *it = &ITEMS[id];
     if (it->inA == ITEM_NONE) return false;                    // no recipe
     if (p->inventory[it->inA] < it->nA) return false;          // missing A
-    if (it->inB != ITEM_NONE && p->inventory[it->inB] < it->nB)
-        return false;                                          // missing B
+    if (it->inB != ITEM_NONE) {
+        if (!PlayerIsTool(it->inB)) {
+            if (p->inventory[it->inB] < it->nB) return false;  // missing B
+        } else {
+            if (p->inventory[it->inB] <= 0) return false;      // tool missing
+        }
+    }
     return true;
 }
 
@@ -241,7 +259,8 @@ static bool PlayerCraft(Player *p, ItemID id) {
     if (!PlayerCanCraft(p, id)) return false;
     const ItemInfo *it = &ITEMS[id];
     PlayerRemoveItem(p, it->inA, it->nA);
-    if (it->inB != ITEM_NONE) PlayerRemoveItem(p, it->inB, it->nB);
+    if (it->inB != ITEM_NONE && !PlayerIsTool(it->inB))
+        PlayerRemoveItem(p, it->inB, it->nB);
     PlayerGiveItem(p, id, it->yield);
     return true;
 }

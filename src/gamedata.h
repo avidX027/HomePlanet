@@ -34,8 +34,20 @@ typedef enum {
 typedef enum {
     ITEM_NONE = 0,    // means "nothing" — slot 0 is reserved for it
     ITEM_WOOD,
+    ITEM_RUBBER,
+    ITEM_SMALL_STONE,
     ITEM_STONE,
+    ITEM_COAL,
+    ITEM_SULFUR_ORE,
+    ITEM_SULFUR,
+    ITEM_METAL_ORE,
+    ITEM_METAL,
+    ITEM_FURNACE,
+    ITEM_GUNPOWDER,
+    ITEM_PISTOL,
+    ITEM_BULLET,
     ITEM_PICKAXE,
+    ITEM_SLINGSHOT,
     ITEM_WALL,        // placeable block
     ITEM_COUNT
 } ItemID;
@@ -63,10 +75,22 @@ typedef struct {
 static const ItemInfo ITEMS[ITEM_COUNT] = {
     //                 name       color                    dps  places      placeable  inA        nA  inB        nB  yield
     [ITEM_NONE]    = { "Nothing", (Color){  0,  0,  0,255}, 0,  TILE_GRASS, false,     ITEM_NONE,  0, ITEM_NONE,  0, 0 },
-    [ITEM_WOOD]    = { "Wood",    (Color){140, 90, 50,255}, 0,  TILE_GRASS, false,     ITEM_NONE,  0, ITEM_NONE,  0, 0 },
-    [ITEM_STONE]   = { "Stone",   (Color){110,110,120,255}, 0,  TILE_GRASS, false,     ITEM_NONE,  0, ITEM_NONE,  0, 0 },
-    [ITEM_PICKAXE] = { "Pickaxe", (Color){200,160,100,255}, 4,  TILE_GRASS, false,     ITEM_WOOD,  5, ITEM_STONE,10, 1 },
-    [ITEM_WALL]    = { "Wall",    (Color){180,180,190,255}, 0,  TILE_WALL,  true,      ITEM_STONE, 2, ITEM_NONE,  0, 4 },
+    [ITEM_WOOD]         = { "Wood",        (Color){140, 90, 50,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
+    [ITEM_RUBBER]       = { "Rubber",      (Color){ 30,150, 30,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
+    [ITEM_SMALL_STONE]  = { "Small Stone", (Color){120,120,120,255}, 0,  TILE_GRASS, false,     ITEM_STONE,      1, ITEM_NONE,    0, 4 },
+    [ITEM_STONE]        = { "Stone",       (Color){110,110,120,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
+    [ITEM_COAL]         = { "Coal",        (Color){ 60, 60, 60,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
+    [ITEM_SULFUR_ORE]   = { "Sulfur Ore",  (Color){220,200, 30,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
+    [ITEM_SULFUR]       = { "Sulfur",      (Color){200,180, 40,255}, 0,  TILE_GRASS, false,     ITEM_SULFUR_ORE, 1, ITEM_FURNACE, 1, 1 },
+    [ITEM_METAL_ORE]    = { "Metal Ore",   (Color){140,140,180,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
+    [ITEM_METAL]        = { "Metal",       (Color){190,190,220,255}, 0,  TILE_GRASS, false,     ITEM_METAL_ORE,  1, ITEM_FURNACE, 1, 1 },
+    [ITEM_FURNACE]      = { "Furnace",     (Color){120,120,130,255}, 0,  TILE_GRASS, false,     ITEM_STONE,      6, ITEM_WOOD,    2, 1 },
+    [ITEM_GUNPOWDER]    = { "Gunpowder",   (Color){100,100,100,255}, 0,  TILE_GRASS, false,     ITEM_COAL,       1, ITEM_SULFUR,  1, 1 },
+    [ITEM_PISTOL]       = { "Pistol",      (Color){130,130,160,255}, 0,  TILE_GRASS, false,     ITEM_WOOD,       1, ITEM_METAL,   4, 1 },
+    [ITEM_BULLET]       = { "Bullet",      (Color){220,190, 70,255}, 0,  TILE_GRASS, false,     ITEM_METAL,      1, ITEM_GUNPOWDER,1, 4 },
+    [ITEM_PICKAXE]      = { "Pickaxe",     (Color){200,160,100,255}, 4,  TILE_GRASS, false,     ITEM_WOOD,       5, ITEM_STONE,  10, 1 },
+    [ITEM_SLINGSHOT]    = { "Slingshot",   (Color){120, 70, 30,255}, 0,  TILE_GRASS, false,     ITEM_WOOD,       3, ITEM_RUBBER, 1, 1 },
+    [ITEM_WALL]         = { "Wall",        (Color){180,180,190,255}, 0,  TILE_WALL,  true,      ITEM_STONE,      2, ITEM_NONE,    0, 4 },
 };
 
 typedef struct {
