@@ -202,54 +202,81 @@ static void UiDrawInventory(const Player *p) {
 static void UiDrawCraftMenu(const Player *p) {
     if (!p->craftMenuOpen) return;
     int sw = GetScreenWidth(), sh = GetScreenHeight();
-    int mw = 560, mh = 400;
+    int mw = 760, mh = 500;
     int mx = (sw-mw)/2, my = (sh-mh)/2;
+    int padding = 20;
+    int headerH = 70;
+    int cardW = 168;
+    int cardH = 112;
+    int gap = 16;
+    int cols = 4;
+    int rows = 3;
 
-    DrawRectangle(0, 0, sw, sh, (Color){0,0,0,140});     // dim the game
-    DrawRectangle(mx, my, mw, mh, (Color){10,10,30,240});
-    DrawRectangleLines(mx, my, mw, mh, SKYBLUE);
+    DrawRectangle(0, 0, sw, sh, (Color){0,0,0,140});
+    DrawRectangleRounded((Rectangle){ mx, my, mw, mh }, 0.08f, 14, (Color){10,10,30,240});
+    DrawRectangleRoundedLines((Rectangle){ mx, my, mw, mh }, 0.08f, 14, SKYBLUE);
     DrawText("CRAFTING", mx+20, my+15, 32, SKYBLUE);
+    DrawText("Hover to preview • Click to craft", mx+20, my+48, 18, GRAY);
 
-    int row = 0;
-    int visibleRows = 4;
-    int maxRows = 0;
+    int craftCount = 0;
     for (ItemID id = 1; id < ITEM_COUNT; id++) {
-        if (ITEMS[id].inA != ITEM_NONE) maxRows++;
+        if (ITEMS[id].inA != ITEM_NONE) craftCount++;
     }
-    int startRow = p->craftScroll;
-    int endRow = startRow + visibleRows;
-    if (endRow > maxRows) endRow = maxRows;
+
+    int startIndex = p->craftScroll;
+    int visible = cols * rows;
+    int endIndex = startIndex + visible;
+    if (endIndex > craftCount) endIndex = craftCount;
+
     int current = 0;
+    int slot = 0;
     for (ItemID id = 1; id < ITEM_COUNT; id++) {
-        if (ITEMS[id].inA == ITEM_NONE) continue;        // not craftable
-        if (current < startRow) {
+        if (ITEMS[id].inA == ITEM_NONE) continue;
+        if (current < startIndex) {
             current++;
             continue;
         }
-        if (current >= endRow) break;
+        if (current >= endIndex) break;
+
         const ItemInfo *it = &ITEMS[id];
-        int  ry  = my + 70 + row * 64;
+        int col = slot % cols;
+        int row = slot / cols;
+        int x = mx + padding + col * (cardW + gap);
+        int y = my + headerH + row * (cardH + gap);
+        Rectangle rect = { (float)x, (float)y, (float)cardW, (float)cardH };
         bool sel = (current == p->craftSel);
-        bool ok  = PlayerCanCraft(p, id);
+        bool ok = PlayerCanCraft(p, id);
 
-        DrawRectangle(mx+12, ry, mw-24, 56,
-                      sel ? (Color){20,60,100,255} : (Color){15,15,40,200});
-        DrawRectangle(mx+24, ry+14, 28, 28, it->color);
-        DrawText(TextFormat("%s x%d", it->name, it->yield),
-                 mx+64, ry+8, 22, WHITE);
-
-        // Build the "costs" line. Ingredient names come from the
-        // table too — no item is ever named in UI code.
-        const char *cost = TextFormat("%d %s", it->nA, ITEMS[it->inA].name);
-        if (it->inB != ITEM_NONE)
-            cost = TextFormat("%s + %d %s", cost, it->nB, ITEMS[it->inB].name);
-        DrawText(cost, mx+64, ry+32, 18, ok ? GREEN : RED);
-
-        if (sel) DrawText("[ENTER]", mx+mw-110, ry+18, 20, GOLD);
-        row++;
+        DrawRectangleRounded(rect, 0.16f, 10, sel ? (Color){24, 70, 120, 250} : (Color){18, 24, 40, 220});
+        DrawRectangleRoundedLines(rect, 0.16f, 10, sel ? GOLD : (Color){100, 120, 150, 220});
+        DrawRectangle(x + 12, y + 12, 36, 36, it->color);
+        DrawText(it->name, x + 58, y + 14, 20, WHITE);
+        DrawText(TextFormat("x%d", it->yield), x + 58, y + 40, 16, LIGHTGRAY);
+        DrawText(ok ? "craftable" : "needs mats", x + 12, y + cardH - 28, 16, ok ? GREEN : ORANGE);
+        slot++;
         current++;
     }
-    DrawText("[UP/DOWN] select   [ENTER] craft   [TAB] close",
+
+    ItemID selectedId = ITEM_NONE;
+    int currentIndex = 0;
+    for (ItemID id = 1; id < ITEM_COUNT; id++) {
+        if (ITEMS[id].inA == ITEM_NONE) continue;
+        if (currentIndex == p->craftSel) {
+            selectedId = id;
+            break;
+        }
+        currentIndex++;
+    }
+
+    if (selectedId != ITEM_NONE) {
+        int detailX = mx + 20;
+        int detailY = my + mh - 72;
+        DrawRectangleRounded((Rectangle){ detailX, detailY, mw - 40, 48 }, 0.1f, 8, (Color){18, 28, 44, 240});
+        DrawText(TextFormat("Selected: %s", ITEMS[selectedId].name), detailX + 12, detailY + 10, 20, WHITE);
+        DrawText("Click any card to craft it", detailX + 12, detailY + 28, 16, SKYBLUE);
+    }
+
+    DrawText("[UP/DOWN/LEFT/RIGHT] navigate   [TAB] close",
              mx+20, my+mh-32, 18, GRAY);
 }
 

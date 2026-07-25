@@ -426,6 +426,9 @@ static void UpdateGame(float dt) {
     if (player.craftMenuOpen) {
         // Menu open: navigation only; the world is paused.
         int n = CraftableCount();
+        int gridCols = 4;
+        int gridRows = 3;
+        int visible = gridCols * gridRows;
         if (n > 0) {
             if (IsKeyPressed(KEY_DOWN)) {
                 player.craftSel = (player.craftSel + 1) % n;
@@ -433,42 +436,57 @@ static void UpdateGame(float dt) {
             if (IsKeyPressed(KEY_UP)) {
                 player.craftSel = (player.craftSel + n - 1) % n;
             }
-            int visibleRows = 4;
+            if (IsKeyPressed(KEY_RIGHT)) {
+                player.craftSel = (player.craftSel + gridCols) % n;
+            }
+            if (IsKeyPressed(KEY_LEFT)) {
+                player.craftSel = (player.craftSel + n - gridCols) % n;
+            }
             if (player.craftSel < player.craftScroll) {
                 player.craftScroll = player.craftSel;
-            } else if (player.craftSel >= player.craftScroll + visibleRows) {
-                player.craftScroll = player.craftSel - visibleRows + 1;
+            } else if (player.craftSel >= player.craftScroll + visible) {
+                player.craftScroll = player.craftSel - visible + 1;
             }
             if (player.craftScroll < 0) player.craftScroll = 0;
-            if (player.craftScroll > n - visibleRows) player.craftScroll = n - visibleRows;
+            if (player.craftScroll > n - visible) player.craftScroll = n - visible;
             if (player.craftScroll < 0) player.craftScroll = 0;
         }
         if (IsKeyPressed(KEY_ENTER)) PlayerCraft(&player, CraftableAtRow(player.craftSel));
         // Mouse support: hovering over a row updates the selected recipe,
         // and clicking the row crafts it immediately.
         int sw = GetScreenWidth(), sh = GetScreenHeight();
-        int mw = 560, mh = 400;
+        int mw = 760, mh = 500;
         int mx = (sw - mw) / 2, my = (sh - mh) / 2;
-        int visibleRows = 4;
-        int startRow = player.craftScroll;
-        int endRow = startRow + visibleRows;
-        if (endRow > n) endRow = n;
+        int padding = 20;
+        int headerH = 70;
+        int cardW = 168;
+        int cardH = 112;
+        int gap = 16;
+        int cols = 4;
+        int rows = 3;
+        int gridVisible = cols * rows;
+        int startIndex = player.craftScroll;
+        int endIndex = startIndex + gridVisible;
+        if (endIndex > n) endIndex = n;
         int current = 0;
-        int row = 0;
+        int slot = 0;
+        Vector2 mouse = GetMousePosition();
         for (ItemID id = 1; id < ITEM_COUNT; id++) {
             if (ITEMS[id].inA == ITEM_NONE) continue;
-            if (current < startRow) {
+            if (current < startIndex) {
                 current++;
                 continue;
             }
-            if (current >= endRow) break;
-            Rectangle r = { mx + 12, my + 70 + row * 64, mw - 24, 56 };
-            UIButton recipeButton = { r, "", false, false };
-            UiButtonUpdate(&recipeButton);
-
-            if (recipeButton.hovered) player.craftSel = current;
-            if (recipeButton.clicked) PlayerCraft(&player, id);
-            row++;
+            if (current >= endIndex) break;
+            int col = slot % cols;
+            int row = slot / cols;
+            int x = mx + padding + col * (cardW + gap);
+            int y = my + headerH + row * (cardH + gap);
+            Rectangle r = { (float)x, (float)y, (float)cardW, (float)cardH };
+            bool hovered = CheckCollisionPointRec(mouse, r);
+            if (hovered) player.craftSel = current;
+            if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) PlayerCraft(&player, id);
+            slot++;
             current++;
         }
         return;
@@ -530,7 +548,7 @@ static void DrawGame(void) {
 
 static void UpdatePause(void) {
     int cx = GetScreenWidth() / 2;
-    int cy = GetScreenHeight() / 2;
+    int cy = GetScreenHeight() / 2; // window center
 
     pauseResumeButton.rect = (Rectangle){ cx - 110, cy - 90, 220, 56 };
     pauseResumeButton.text = "RESUME";
