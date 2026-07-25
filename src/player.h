@@ -17,10 +17,25 @@
 #include "config.h"
 #include "gamedata.h"
 
+#define HOTBAR_MAX_SLOTS 7
+#define INVENTORY_COLS 10
+#define INVENTORY_ROWS 10
+#define INVENTORY_SIZE (INVENTORY_COLS * INVENTORY_ROWS)
+
 typedef struct {
     Vector2 pos;                       // world-space position, in pixels
     int     inventory[ITEM_COUNT];     // count of each item owned
     ItemID  selected;                  // which item the hotbar has active
+    ItemID  hotbar[HOTBAR_MAX_SLOTS]; // item ids in the visible slots
+    int     slotCount;                 // how many slots are currently in use
+    int     selectedSlot;              // which slot is currently active
+    ItemID  inventorySlots[INVENTORY_SIZE];
+    int     inventoryAmounts[INVENTORY_SIZE];
+    int     inventorySlotCount;
+    bool    inventoryOpen;
+    int     inventoryCursor;           // currently hovered/selected grid slot
+    bool    inventoryDragging;
+    int     inventoryDragIndex;
     bool    craftMenuOpen;
     int     craftSel;                  // highlighted row in craft menu
 } Player;
@@ -33,9 +48,144 @@ static void PlayerInit(Player *p) {
     p->pos = (Vector2){ WORLD_SIZE * TILE_SIZE / 2.0f,
                         WORLD_SIZE * TILE_SIZE / 2.0f };   // world center
     for (int i = 0; i < ITEM_COUNT; i++) p->inventory[i] = 0;
+    for (int i = 0; i < HOTBAR_MAX_SLOTS; i++) p->hotbar[i] = ITEM_NONE;
     p->selected      = ITEM_NONE;      // empty hands
+    p->slotCount     = HOTBAR_MAX_SLOTS;
+    p->selectedSlot  = 0;
+    for (int i = 0; i < INVENTORY_SIZE; i++) {
+        p->inventorySlots[i] = ITEM_NONE;
+        p->inventoryAmounts[i] = 0;
+    }
+    p->inventorySlotCount = 0;
+    p->inventoryOpen = false;
+    p->inventoryCursor = 0;
+    p->inventoryDragging = false;
+    p->inventoryDragIndex = -1;
     p->craftMenuOpen = false;
     p->craftSel      = 0;
+}
+
+static void PlayerSelectSlot(Player *p, int slot) {
+    if (slot < 0 || slot >= HOTBAR_MAX_SLOTS) return;
+    p->selectedSlot = slot;
+    if (slot < INVENTORY_SIZE && p->inventorySlots[slot] != ITEM_NONE && p->inventoryAmounts[slot] > 0) {
+        p->selected = p->inventorySlots[slot];
+    } else {
+        p->selected = ITEM_NONE;
+    }
+    p->hotbar[slot] = p->selected;
+}
+
+static void PlayerToggleInventory(Player *p) {
+    p->inventoryOpen = !p->inventoryOpen;
+    if (!p->inventoryOpen) {
+        p->inventoryDragging = false;
+        p->inventoryDragIndex = -1;
+    }
+}
+
+static void PlayerRefreshInventorySlotCount(Player *p) {
+    p->inventorySlotCount = 0;
+    for (int i = 0; i < INVENTORY_SIZE; i++) {
+        if (p->inventorySlots[i] != ITEM_NONE && p->inventoryAmounts[i] > 0)
+            p->inventorySlotCount++;
+    }
+}
+
+static void PlayerInventorySwapSlots(Player *p, int a, int b) {
+    if (a < 0 || b < 0 || a >= INVENTORY_SIZE || b >= INVENTORY_SIZE || a == b) return;
+    ItemID itemA = p->inventorySlots[a];
+    int amtA = p->inventoryAmounts[a];
+    p->inventorySlots[a] = p->inventorySlots[b];
+    p->inventoryAmounts[a] = p->inventoryAmounts[b];
+    p->inventorySlots[b] = itemA;
+    p->inventoryAmounts[b] = amtA;
+    PlayerRefreshInventorySlotCount(p);
+}
+
+static void PlayerEnsureHotbarContains(Player *p, ItemID id) {
+    if (id == ITEM_NONE) return;
+    for (int i = 0; i < HOTBAR_MAX_SLOTS; i++) {
+        if (p->inventorySlots[i] == id && p->inventoryAmounts[i] > 0) {
+            PlayerSelectSlot(p, i);
+            return;
+        }
+    }
+    for (int i = 0; i < HOTBAR_MAX_SLOTS; i++) {
+        if (p->inventorySlots[i] == ITEM_NONE || p->inventoryAmounts[i] <= 0) {
+            p->inventorySlots[i] = id;
+            p->inventoryAmounts[i] = 0;
+            PlayerSelectSlot(p, i);
+            return;
+        }
+    }
+}
+
+static void PlayerSelectRelative(Player *p, int delta) {
+    if (p->slotCount <= 0) return;
+    int next = p->selectedSlot + delta;
+    while (next < 0) next += p->slotCount;
+    while (next >= p->slotCount) next -= p->slotCount;
+    PlayerSelectSlot(p, next);
+}
+
+static void PlayerGiveItem(Player *p, ItemID id, int amount) {
+    if (id == ITEM_NONE || amount <= 0) return;
+    p->inventory[id] += amount;
+
+    for (int i = 0; i < INVENTORY_SIZE; i++) {
+        if (p->inventorySlots[i] == id && p->inventoryAmounts[i] > 0) {
+            p->inventoryAmounts[i] += amount;
+            PlayerEnsureHotbarContains(p, id);
+            PlayerRefreshInventorySlotCount(p);
+            return;
+        }
+    }
+
+    for (int i = 0; i < INVENTORY_SIZE; i++) {
+        if (p->inventorySlots[i] == ITEM_NONE || p->inventoryAmounts[i] <= 0) {
+            p->inventorySlots[i] = id;
+            p->inventoryAmounts[i] = amount;
+            PlayerEnsureHotbarContains(p, id);
+            PlayerRefreshInventorySlotCount(p);
+            return;
+        }
+    }
+
+    PlayerEnsureHotbarContains(p, id);
+}
+
+static void PlayerRemoveItem(Player *p, ItemID id, int amount) {
+    if (id == ITEM_NONE || amount <= 0) return;
+    for (int i = 0; i < INVENTORY_SIZE; i++) {
+        if (p->inventorySlots[i] != id || p->inventoryAmounts[i] <= 0) continue;
+        int take = amount < p->inventoryAmounts[i] ? amount : p->inventoryAmounts[i];
+        p->inventoryAmounts[i] -= take;
+        p->inventory[id] -= take;
+        amount -= take;
+        if (p->inventoryAmounts[i] <= 0) {
+            p->inventorySlots[i] = ITEM_NONE;
+            p->inventoryAmounts[i] = 0;
+        }
+        if (amount <= 0) break;
+    }
+    PlayerRefreshInventorySlotCount(p);
+}
+
+static void PlayerRemoveSelectedItem(Player *p, int amount) {
+    if (p->selectedSlot < 0 || p->selectedSlot >= HOTBAR_MAX_SLOTS) return;
+    int slot = p->selectedSlot;
+    ItemID id = p->inventorySlots[slot];
+    if (id == ITEM_NONE || p->inventoryAmounts[slot] <= 0) return;
+    int take = amount < p->inventoryAmounts[slot] ? amount : p->inventoryAmounts[slot];
+    p->inventoryAmounts[slot] -= take;
+    p->inventory[id] -= take;
+    if (p->inventoryAmounts[slot] <= 0) {
+        p->inventorySlots[slot] = ITEM_NONE;
+        p->inventoryAmounts[slot] = 0;
+        p->selected = ITEM_NONE;
+    }
+    PlayerRefreshInventorySlotCount(p);
 }
 
 // ─── Movement (WASD), clamped to world edges ──────────────
@@ -90,9 +240,9 @@ static bool PlayerCanCraft(const Player *p, ItemID id) {
 static bool PlayerCraft(Player *p, ItemID id) {
     if (!PlayerCanCraft(p, id)) return false;
     const ItemInfo *it = &ITEMS[id];
-    p->inventory[it->inA] -= it->nA;
-    if (it->inB != ITEM_NONE) p->inventory[it->inB] -= it->nB;
-    p->inventory[id] += it->yield;
+    PlayerRemoveItem(p, it->inA, it->nA);
+    if (it->inB != ITEM_NONE) PlayerRemoveItem(p, it->inB, it->nB);
+    PlayerGiveItem(p, id, it->yield);
     return true;
 }
 

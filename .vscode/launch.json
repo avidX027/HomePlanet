@@ -2,11 +2,11 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Launch Game",
+            "name": "Launch HomePlanet",
             "type": "cppdbg",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "preLaunchTask": "Build",
+            "preLaunchTask": "Build HomePlanet",
             "program": "${workspaceFolder}/bin/HomePlanet",
             "MIMode": "lldb",
             "windows": {

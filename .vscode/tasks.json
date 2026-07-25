@@ -2,7 +2,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build",
+            "label": "Build HomePlanet",
             "type": "shell",
             "command": "make",
             "windows": {
@@ -27,6 +27,32 @@
                 "command": "C:/msys64/ucrt64/bin/mingw32-make.exe clean"
             },
             "problemMatcher": []
+        },
+        {
+            "label": "Run HomePlanet",
+            "type": "shell",
+            "command": "make run",
+            "windows": {
+                "command": "C:/msys64/ucrt64/bin/mingw32-make.exe run"
+            },
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "C/C++: clang build active file",
+            "type": "shell",
+            "command": "make",
+            "windows": {
+                "command": "C:/msys64/ucrt64/bin/mingw32-make.exe"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
         }
     ]
 }
