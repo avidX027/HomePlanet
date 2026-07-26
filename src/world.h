@@ -54,7 +54,17 @@ typedef struct {
     float         health;
     unsigned char biome;
     unsigned char variant;
+    unsigned char ore;      // 0 = plain ground, 1 = sulfur field,
+                            // 2 = metal field, 3 = coal field.
+                            // Survives mining the node ON it —
+                            // clear it, then place a drill.
 } Tile;
+
+// Rocks and ore nodes share the size-variant system and collision.
+static bool TileIsRockLike(TileType t) {
+    return t == TILE_ROCK || t == TILE_SULFUR_NODE ||
+           t == TILE_METAL_NODE || t == TILE_COAL_NODE;
+}
 
 // C CONCEPT — 2D array: WORLD_SIZE * WORLD_SIZE Tiles in one block
 // of memory. world[x][y] picks one. ~1.8MB at 384x384 — still fine.
@@ -75,6 +85,55 @@ static unsigned int WorldHash(int x, int y) {
     unsigned int h = (unsigned int)x * 374761393u + (unsigned int)y * 668265263u;
     h = (h ^ (h >> 13)) * 1274126177u;
     return h ^ (h >> 16);
+}
+
+// ─── Day cycle & shadows ──────────────────────────────────
+// The "sun" makes one lap per DAY_LENGTH_SECONDS of play time, so
+// every shadow in the world slowly swings around its object as the
+// day progresses. main.c feeds the clock in each frame (world.h
+// can't see the entities' game timer — layering).
+static Vector2 worldShadowVec = { 6, 5 };   // current shadow offset, px
+
+static void WorldSetClock(float seconds) {
+    float frac = fmodf(seconds, DAY_LENGTH_SECONDS) / DAY_LENGTH_SECONDS;  // 0..1
+    float ang  = frac * 2.0f * PI;
+    // Shadows stretch at "sunrise/sunset" and shrink toward "noon".
+    float len  = TILE_SIZE * (0.20f + 0.14f * fabsf(cosf(ang)));
+    worldShadowVec = (Vector2){ cosf(ang) * len, sinf(ang) * len };
+}
+
+#define WORLD_SHADOW_COLOR (Color){ 12, 18, 12, 44 }   // light, not goth
+
+// Blend two colors; t = 0 → a, t = 1 → b.
+static Color WorldMix(Color a, Color b, float t) {
+    return (Color){ (unsigned char)(a.r + (b.r - a.r) * t),
+                    (unsigned char)(a.g + (b.g - a.g) * t),
+                    (unsigned char)(a.b + (b.b - a.b) * t), a.a };
+}
+
+// What color is the GROUND of tile (x,y)? Biome base, shifted
+// toward the ore color where an ore field lies. Shared by the
+// world renderer and the minimap so they can never disagree.
+static Color WorldGroundColor(int x, int y) {
+    Color g = BIOME_GROUND[world[x][y].biome];
+    if (world[x][y].ore == 1) g = WorldMix(g, (Color){ 176, 156, 44, 255 }, 0.55f);
+    if (world[x][y].ore == 2) g = WorldMix(g, (Color){ 118, 124, 164, 255 }, 0.55f);
+    if (world[x][y].ore == 3) g = WorldMix(g, (Color){  58,  56,  62, 255 }, 0.60f);
+    return g;
+}
+
+// Which solid node grows on an ore field of this type?
+static TileType WorldOreNodeTile(unsigned char ore) {
+    if (ore == 1) return TILE_SULFUR_NODE;
+    if (ore == 2) return TILE_METAL_NODE;
+    return TILE_COAL_NODE;
+}
+
+// Which item does a drill on this field pump?
+static ItemID WorldOreItem(unsigned char ore) {
+    if (ore == 1) return ITEM_SULFUR_ORE;
+    if (ore == 2) return ITEM_METAL_ORE;
+    return ITEM_COAL;
 }
 
 // Reveal the fog around a world-space position.
@@ -99,7 +158,7 @@ static void WorldRevealAround(Vector2 posPx, int radiusTiles) {
 // carrying a biome; every tile takes the biome of its NEAREST seed.
 // Enemy territory is different: a handful of BIG circular
 // infestation patches placed far from spawn, like biter bases.
-#define BIOME_SEEDS 22
+#define BIOME_SEEDS 40   // more seeds for the much bigger map
 static void WorldInit(void) {
     int seedX[BIOME_SEEDS], seedY[BIOME_SEEDS];
     Biome seedB[BIOME_SEEDS];
@@ -173,6 +232,7 @@ static void WorldInit(void) {
             world[x][y].health = TILES[t].maxHealth;
             world[x][y].biome  = (unsigned char)b;
             world[x][y].variant = 0;
+            world[x][y].ore    = 0;
 
             // Rocks come in sizes: full, 3/4 (one open corner),
             // half, and quarter pebbles you can step over. Smaller
@@ -184,6 +244,48 @@ static void WorldInit(void) {
                 world[x][y].variant = (unsigned char)(size | (corner << 2));
                 static const float sizeHp[4] = { 1.0f, 0.8f, 0.6f, 0.35f };
                 world[x][y].health = TILES[t].maxHealth * sizeHp[size];
+            }
+        }
+    }
+
+    // ── Ore fields ────────────────────────────────────────
+    // Factorio-style: blobby colored patches of ore GROUND (place a
+    // drill on one and it pumps ore forever), with solid ore NODES
+    // clustered on and around each patch. Nodes reuse the rock
+    // size-variant system, so they vary from pebbles to full chunks.
+    int totalPatches = ORE_SULFUR_PATCHES + ORE_METAL_PATCHES + ORE_COAL_PATCHES;
+    for (int i = 0; i < totalPatches; i++) {
+        unsigned char oreType = (i < ORE_SULFUR_PATCHES) ? 1
+                              : (i < ORE_SULFUR_PATCHES + ORE_METAL_PATCHES) ? 2 : 3;
+        TileType nodeTile = WorldOreNodeTile(oreType);
+        int pcx = 0, pcy = 0;
+        // A few tries to land away from the spawn clearing.
+        for (int attempt = 0; attempt < 8; attempt++) {
+            pcx = GetRandomValue(12, WORLD_SIZE - 13);
+            pcy = GetRandomValue(12, WORLD_SIZE - 13);
+            long dx = pcx - center, dy = pcy - center;
+            if (dx * dx + dy * dy > (long)(SPAWN_CLEAR_RADIUS + 14) * (SPAWN_CLEAR_RADIUS + 14)) break;
+        }
+        int radius = GetRandomValue(ORE_PATCH_RADIUS_MIN, ORE_PATCH_RADIUS_MAX);
+
+        for (int x = pcx - radius; x <= pcx + radius; x++) {
+            for (int y = pcy - radius; y <= pcy + radius; y++) {
+                if (x < 1 || x >= WORLD_SIZE - 1 || y < 1 || y >= WORLD_SIZE - 1) continue;
+                long dx = x - pcx, dy = y - pcy;
+                long r = radius - (long)(WorldHash(x, y) % 3);   // chewed edge
+                if (dx * dx + dy * dy > r * r) continue;
+                world[x][y].ore = oreType;
+                // Grow a solid node here?
+                if (world[x][y].type == TILE_GRASS &&
+                    GetRandomValue(1, 100) <= ORE_NODE_CHANCE) {
+                    int sroll = GetRandomValue(1, 100);
+                    int size = (sroll <= 30) ? 0 : (sroll <= 55) ? 1 : (sroll <= 80) ? 2 : 3;
+                    int corner = GetRandomValue(0, 3);
+                    static const float sizeHp[4] = { 1.0f, 0.8f, 0.6f, 0.35f };
+                    world[x][y].type    = nodeTile;
+                    world[x][y].variant = (unsigned char)(size | (corner << 2));
+                    world[x][y].health  = TILES[nodeTile].maxHealth * sizeHp[size];
+                }
             }
         }
     }
@@ -228,7 +330,7 @@ static int WorldSolidRects(int x, int y, Rectangle out[2]) {
         out[0] = (Rectangle){ px + (ts - trunk) / 2, py + (ts - trunk) / 2, trunk, trunk };
         return 1;
     }
-    if (t == TILE_ROCK) {
+    if (TileIsRockLike(t)) {
         int size   = world[x][y].variant & 3;
         int corner = (world[x][y].variant >> 2) & 3;   // 0 TL, 1 TR, 2 BL, 3 BR
         bool right  = (corner & 1) != 0;
@@ -305,6 +407,65 @@ static bool WorldDamageTile(int x, int y, float damage) {
     return false;
 }
 
+// ─── Irregular blobs (rocks, tree canopies) ───────────────
+// An organic silhouette: vertices walk a circle at hash-jittered
+// radii, so every stone and every canopy has its own outline —
+// nothing reads as an egg or a rounded UI box.
+//
+// C/GRAPHICS NOTE — each wedge is drawn TWICE, with its two
+// vertices swapped. Triangle visibility depends on winding order
+// (clockwise vs counter-clockwise) once backface culling is on, and
+// raylib's 2D Y axis points down, which flips the usual convention.
+// Drawing both windings means the shape is visible either way — a
+// cheap certainty rather than a guess.
+#define BLOB_PTS 11
+static void WorldBlobPoints(Vector2 *out, float cx, float cy, float rx, float ry,
+                            unsigned int seed, float jagLo, float jagSpan) {
+    for (int i = 0; i < BLOB_PTS; i++) {
+        unsigned int h = seed ^ (unsigned int)(i * 2654435761u);
+        float jag = jagLo + ((h >> 7) & 63) / 63.0f * jagSpan;
+        float ang = (i / (float)BLOB_PTS) * 2.0f * PI + (seed % 17) * 0.09f;
+        out[i] = (Vector2){ cx + cosf(ang) * rx * jag, cy + sinf(ang) * ry * jag };
+    }
+}
+
+static void WorldFillBlob(const Vector2 *pts, Vector2 center, Color c) {
+    for (int i = 0; i < BLOB_PTS; i++) {
+        Vector2 a = pts[i], b = pts[(i + 1) % BLOB_PTS];
+        DrawTriangle(center, a, b, c);
+        DrawTriangle(center, b, a, c);   // opposite winding — always visible
+    }
+}
+
+static void WorldOutlineBlob(const Vector2 *pts, Color c, float thick) {
+    for (int i = 0; i < BLOB_PTS; i++) {
+        DrawLineEx(pts[i], pts[(i + 1) % BLOB_PTS], thick, c);
+    }
+}
+
+// A faceted boulder: solid body in its own color, then two interior
+// facets (lit and shadowed) that follow the same jagged geometry —
+// so the shading reads as stone planes, not an airbrushed egg.
+static void WorldDrawRockLobe(float cx, float cy, float rx, float ry,
+                              unsigned int seed, Color base, Color hi, Color lo, Color rim) {
+    Vector2 body[BLOB_PTS], facet[BLOB_PTS];
+    Vector2 center = { cx, cy };
+    WorldBlobPoints(body, cx, cy, rx, ry, seed, 0.70f, 0.45f);
+    WorldFillBlob(body, center, base);
+
+    // Lit facet, offset toward the top-left.
+    Vector2 hiC = { cx - rx * 0.22f, cy - ry * 0.26f };
+    WorldBlobPoints(facet, hiC.x, hiC.y, rx * 0.52f, ry * 0.44f, seed * 7u + 3u, 0.72f, 0.4f);
+    WorldFillBlob(facet, hiC, hi);
+
+    // Shadowed facet along the bottom-right edge.
+    Vector2 loC = { cx + rx * 0.26f, cy + ry * 0.30f };
+    WorldBlobPoints(facet, loC.x, loC.y, rx * 0.42f, ry * 0.32f, seed * 13u + 7u, 0.7f, 0.4f);
+    WorldFillBlob(facet, loC, lo);
+
+    WorldOutlineBlob(body, rim, 1.6f);
+}
+
 // ─── Draw the visible tiles ───────────────────────────────
 // The world is 384x384 = 147k tiles; drawing them ALL every frame
 // would waste ~98% of the work off-screen. The caller (main.c)
@@ -332,7 +493,7 @@ static void WorldDraw(Vector2 viewTopLeft, Vector2 viewBottomRight, Vector2 focu
     for (int x = x0; x <= x1; x++) {
         for (int y = y0; y <= y1; y++) {
             float px = x * ts, py = y * ts;
-            Color g = BIOME_GROUND[world[x][y].biome];
+            Color g = WorldGroundColor(x, y);   // biome + ore-field tint
             DrawRectangle((int)px, (int)py, (int)ts + 1, (int)ts + 1, g);
 
             unsigned int h = WorldHash(x, y);
@@ -344,10 +505,55 @@ static void WorldDraw(Vector2 viewTopLeft, Vector2 viewBottomRight, Vector2 focu
                                      (unsigned char)(g.b + (255 - g.b) / 6), 255 };
             DrawRectangle((int)(px + (h % 19)), (int)(py + ((h >> 5) % 19)), 2, 2, darker);
             DrawRectangle((int)(px + ((h >> 10) % 19)), (int)(py + ((h >> 15) % 19)), 2, 2, lighter);
+
+            // Ore fields get chunky lumps so they read like ore from
+            // a distance, Factorio-style.
+            if (world[x][y].ore != 0) {
+                DrawRectangle((int)(px + (h % 15)), (int)(py + ((h >> 7) % 15)), 4, 3,
+                              ItemArtShade(g, 0.66f));
+                DrawRectangle((int)(px + ((h >> 11) % 16)), (int)(py + ((h >> 3) % 16)), 3, 3,
+                              ItemArtShade(g, 1.35f));
+            }
         }
     }
 
-    // PASS 2 — features on top of the ground.
+    // PASS 2 — shadows. Every solid thing drops a soft ellipse (or
+    // square, for square things) offset by the current sun angle.
+    // A separate pass so shadows always land UNDER features, even a
+    // neighbor's.
+    for (int x = x0; x <= x1; x++) {
+        for (int y = y0; y <= y1; y++) {
+            TileType t = world[x][y].type;
+            if (t == TILE_GRASS) continue;
+            float px = x * ts, py = y * ts;
+            float sx = worldShadowVec.x, sy = worldShadowVec.y;
+
+            if (t == TILE_TREE) {
+                float cx = px + ts / 2, cy = py + ts / 2;
+                float r1 = ts * (0.50f + (WorldHash(x, y) % 5) * 0.03f);
+                DrawEllipse((int)(cx + sx), (int)(cy + sy), r1 * 1.05f, r1 * 0.85f,
+                            WORLD_SHADOW_COLOR);
+            } else if (TileIsRockLike(t)) {
+                Rectangle rects[2];
+                int n = WorldSolidRects(x, y, rects);
+                for (int r = 0; r < n; r++) {
+                    DrawEllipse((int)(rects[r].x + rects[r].width / 2 + sx * 0.8f),
+                                (int)(rects[r].y + rects[r].height / 2 + sy * 0.8f),
+                                rects[r].width * 0.55f, rects[r].height * 0.5f,
+                                WORLD_SHADOW_COLOR);
+                }
+                // Quarter pebbles are low — barely any shadow.
+            } else {
+                // Walls, machines, spawners: square-ish shadow.
+                DrawRectangle((int)(px + sx * 0.7f), (int)(py + sy * 0.7f),
+                              (int)ts, (int)ts, WORLD_SHADOW_COLOR);
+            }
+        }
+    }
+
+    // PASS 3 — the features themselves. Mining damage TINTS the
+    // entity's own pixels darker (no more square overlay boxes) —
+    // the darkening has exactly the shape of the tree or boulder.
     for (int x = x0; x <= x1; x++) {
         for (int y = y0; y <= y1; y++) {
             TileType t = world[x][y].type;
@@ -356,88 +562,106 @@ static void WorldDraw(Vector2 viewTopLeft, Vector2 viewBottomRight, Vector2 focu
             float px = x * ts, py = y * ts;
             unsigned int h = WorldHash(x, y);
 
-            if (t == TILE_ROCK) {
-                // Boulders drawn FROM their collision rects, so the
-                // visible stone exactly matches what blocks you.
+            // 1.0 = healthy, sinking toward 0.4 as it's mined out.
+            float lum = 1.0f;
+            if (info->maxHealth > 1 && world[x][y].health < info->maxHealth) {
+                lum = 0.4f + 0.6f * (world[x][y].health / info->maxHealth);
+            }
+
+            if (TileIsRockLike(t)) {
+                // Jagged boulders drawn FROM the collision rects, so
+                // looks match physics. Ore nodes use the same shapes
+                // in their ore's color, with glints on top.
                 Rectangle rects[2];
                 int n = WorldSolidRects(x, y, rects);
-                Color base = (Color){ (unsigned char)(96 + h % 24),
-                                      (unsigned char)(96 + h % 24),
-                                      (unsigned char)(104 + h % 20), 255 };
+                Color stone = (t == TILE_ROCK)
+                    ? (Color){ (unsigned char)(102 + h % 26), (unsigned char)(102 + h % 26),
+                               (unsigned char)(112 + h % 18), 255 }
+                    : TILES[t].color;
+                Color base = ItemArtShade(stone, lum);
+                Color hi   = ItemArtShade(base, 1.28f);
+                Color lo   = ItemArtShade(base, 0.72f);
+                Color rim  = ItemArtShade((Color){ 46, 46, 54, 255 }, lum);
                 if (n == 0) {
-                    // Quarter pebble: small stone in its corner.
+                    // Quarter pebble: a small stone in its corner.
                     int corner = (world[x][y].variant >> 2) & 3;
-                    float qx = px + ((corner & 1) ? ts * 0.5f : ts * 0.1f);
-                    float qy = py + ((corner & 2) ? ts * 0.5f : ts * 0.1f);
-                    Rectangle q = { qx, qy, ts * 0.4f, ts * 0.4f };
-                    DrawRectangleRounded(q, 0.6f, 6, base);
-                    DrawRectangleRoundedLines(q, 0.6f, 6, (Color){ 40, 40, 48, 255 });
+                    float cx = px + ((corner & 1) ? ts * 0.68f : ts * 0.32f);
+                    float cy = py + ((corner & 2) ? ts * 0.68f : ts * 0.32f);
+                    WorldDrawRockLobe(cx, cy, ts * 0.23f, ts * 0.19f, h, base, hi, lo, rim);
                 } else {
                     for (int r = 0; r < n; r++) {
-                        Rectangle rr = { rects[r].x + 1, rects[r].y + 1,
-                                         rects[r].width - 2, rects[r].height - 2 };
-                        DrawRectangleRounded(rr, 0.35f, 6, base);
-                        // top-left light, bottom-right shade = cheap 3D
-                        DrawRectangleRounded((Rectangle){ rr.x + 2, rr.y + 2,
-                                             rr.width * 0.45f, rr.height * 0.35f }, 0.6f, 4,
-                                             (Color){ (unsigned char)(base.r + 26),
-                                                      (unsigned char)(base.g + 26),
-                                                      (unsigned char)(base.b + 26), 255 });
-                        DrawRectangleRoundedLines(rr, 0.35f, 6, (Color){ 40, 40, 48, 255 });
+                        float cx = rects[r].x + rects[r].width / 2;
+                        float cy = rects[r].y + rects[r].height / 2;
+                        // jitter each lobe a touch so no two match
+                        cx += (float)(h % 5) - 2;  cy += (float)((h >> 3) % 5) - 2;
+                        WorldDrawRockLobe(cx, cy, rects[r].width * 0.52f,
+                                          rects[r].height * 0.50f, h, base, hi, lo, rim);
+                        h = h * 1664525u + 1013904223u;   // next lobe differs
                     }
                 }
+                if (t != TILE_ROCK) {
+                    // Bright mineral glints — ore should sparkle.
+                    Color glint = ItemArtShade(TILES[t].color, 1.6f);
+                    DrawRectangle((int)(px + 4 + (h % 10)), (int)(py + 5 + ((h >> 4) % 10)),
+                                  3, 3, glint);
+                    DrawRectangle((int)(px + ts * 0.55f), (int)(py + ts * 0.3f), 2, 2,
+                                  (Color){ 255, 255, 255, 210 });
+                }
             } else if (t == TILE_TREE) {
-                // Factorio-scale tree: small trunk + a canopy of a
-                // few circles that FADES when you stand close.
+                // Factorio-scale tree: a tapered trunk plus a ragged
+                // canopy built from irregular blobs — dark underside,
+                // mid body, sunlit crown — so it reads as foliage
+                // rather than a green egg. Fades when you stand close.
                 float cx = px + ts / 2, cy = py + ts / 2;
-                DrawRectangleRounded((Rectangle){ cx - ts * 0.14f, cy - ts * 0.16f,
-                                     ts * 0.28f, ts * 0.42f }, 0.5f, 4,
-                                     (Color){ 92, 62, 34, 255 });
+                Color bark = ItemArtShade((Color){ 88, 58, 32, 255 }, lum);
+                DrawRectangleRounded((Rectangle){ cx - ts * 0.10f, cy - ts * 0.05f,
+                                     ts * 0.20f, ts * 0.40f }, 0.4f, 4, bark);
+                DrawRectangle((int)(cx - ts * 0.02f), (int)(cy - ts * 0.05f),
+                              2, (int)(ts * 0.38f), ItemArtShade(bark, 0.72f));
+
                 float d = Vector2Distance(focus, (Vector2){ cx, cy });
-                float fade = (d < ts * 2.6f) ? 0.35f + 0.65f * (d / (ts * 2.6f)) : 1.0f;
-                unsigned char a = (unsigned char)(235 * fade);
+                float fade = (d < ts * 2.6f) ? 0.32f + 0.68f * (d / (ts * 2.6f)) : 1.0f;
+                unsigned char a = (unsigned char)(238 * fade);
+
                 Color leaf = (world[x][y].biome == BIOME_FOREST)
-                           ? (Color){ 24, 96, 40, a } : (Color){ 38, 122, 48, a };
-                Color leafLight = (Color){ (unsigned char)(leaf.r + 22),
-                                           (unsigned char)(leaf.g + 26),
-                                           (unsigned char)(leaf.b + 18), a };
-                float r1 = ts * (0.50f + (h % 5) * 0.03f);
-                DrawCircleV((Vector2){ cx, cy - ts * 0.14f }, r1, leaf);
-                DrawCircleV((Vector2){ cx - ts * 0.28f, cy + ts * 0.05f }, r1 * 0.62f, leaf);
-                DrawCircleV((Vector2){ cx + ts * 0.26f, cy + ts * 0.02f }, r1 * 0.66f, leaf);
-                DrawCircleV((Vector2){ cx - ts * 0.08f, cy - ts * 0.22f }, r1 * 0.45f, leafLight);
+                           ? (Color){ 30, 92, 42, 255 } : (Color){ 44, 116, 52, 255 };
+                leaf = ItemArtShade(leaf, lum);
+                Color leafDark = ItemArtShade(leaf, 0.66f);
+                Color leafMid  = leaf;
+                Color leafLit  = ItemArtShade(leaf, 1.32f);
+                leafDark.a = a; leafMid.a = a; leafLit.a = a;
+
+                Vector2 blob[BLOB_PTS];
+                float r1 = ts * (0.48f + (h % 5) * 0.028f);
+                // shaded underside, offset down
+                Vector2 c0 = { cx, cy - ts * 0.04f };
+                WorldBlobPoints(blob, c0.x, c0.y, r1, r1 * 0.84f, h, 0.80f, 0.34f);
+                WorldFillBlob(blob, c0, leafDark);
+                // main body, lifted
+                Vector2 c1 = { cx - ts * 0.02f, cy - ts * 0.14f };
+                WorldBlobPoints(blob, c1.x, c1.y, r1 * 0.90f, r1 * 0.78f, h * 3u + 1u, 0.82f, 0.32f);
+                WorldFillBlob(blob, c1, leafMid);
+                // sunlit crown toward the top-left
+                Vector2 c2 = { cx - ts * 0.13f, cy - ts * 0.24f };
+                WorldBlobPoints(blob, c2.x, c2.y, r1 * 0.50f, r1 * 0.42f, h * 11u + 5u, 0.80f, 0.34f);
+                WorldFillBlob(blob, c2, leafLit);
             } else if (t == TILE_WALL || t == TILE_METAL_WALL) {
                 // Bevelled block: light top edge, dark bottom edge.
-                DrawRectangle((int)px, (int)py, (int)ts, (int)ts, info->color);
-                DrawRectangle((int)px, (int)py, (int)ts, 3,
-                              (Color){ (unsigned char)(info->color.r + 34),
-                                       (unsigned char)(info->color.g + 34),
-                                       (unsigned char)(info->color.b + 34), 255 });
-                DrawRectangle((int)px, (int)(py + ts - 3), (int)ts, 3,
-                              (Color){ (unsigned char)(info->color.r * 3 / 5),
-                                       (unsigned char)(info->color.g * 3 / 5),
-                                       (unsigned char)(info->color.b * 3 / 5), 255 });
+                Color wallC = ItemArtShade(info->color, lum);
+                DrawRectangle((int)px, (int)py, (int)ts, (int)ts, wallC);
+                DrawRectangle((int)px, (int)py, (int)ts, 3, ItemArtShade(wallC, 1.22f));
+                DrawRectangle((int)px, (int)(py + ts - 3), (int)ts, 3, ItemArtShade(wallC, 0.6f));
             } else if (t == TILE_SPAWNER) {
                 // Organic nest mound (entities.h adds the pulse).
                 DrawCircleV((Vector2){ px + ts / 2, py + ts / 2 }, ts * 0.46f,
-                            (Color){ 74, 30, 88, 255 });
+                            ItemArtShade((Color){ 74, 30, 88, 255 }, lum));
                 DrawCircleV((Vector2){ px + ts / 3, py + ts / 3 }, ts * 0.2f,
-                            (Color){ 96, 44, 110, 255 });
+                            ItemArtShade((Color){ 96, 44, 110, 255 }, lum));
             } else {
                 // Machines/doors: a base plate; entities.h draws the
                 // item sprite and direction arrows on top.
                 DrawRectangleRounded((Rectangle){ px + 1, py + 1, ts - 2, ts - 2 },
-                                     0.2f, 4, info->color);
-            }
-
-            // Darken partially-mined tiles so damage is visible.
-            float maxHp = info->maxHealth;
-            if (maxHp > 1 && world[x][y].health < maxHp) {
-                float missing = 1.0f - (world[x][y].health / maxHp);
-                if (missing > 0) {
-                    DrawRectangle((int)px, (int)py, (int)ts, (int)ts,
-                                  (Color){ 0, 0, 0, (unsigned char)(missing * 150) });
-                }
+                                     0.2f, 4, ItemArtShade(info->color, lum));
             }
         }
     }
@@ -471,7 +695,7 @@ static void WorldMinimapRefresh(void) {
                 c = (Color){ 8, 8, 14, 255 };   // fog of war: never seen
             } else {
                 TileType t = world[x][y].type;
-                c = (t == TILE_GRASS) ? BIOME_GROUND[world[x][y].biome] : TILES[t].color;
+                c = (t == TILE_GRASS) ? WorldGroundColor(x, y) : TILES[t].color;
                 if (t == TILE_SPAWNER) c = (Color){ 220, 60, 220, 255 };  // nests pop
             }
             worldMinimapPixels[y * WORLD_SIZE + x] = c;   // images are row-major

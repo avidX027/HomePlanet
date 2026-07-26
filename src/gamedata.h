@@ -26,12 +26,16 @@ typedef enum {
     TILE_GRASS = 0,   // walkable ground; what broken tiles turn into
     TILE_TREE,
     TILE_ROCK,
+    TILE_SULFUR_NODE,   // solid ore chunk; clusters on sulfur fields
+    TILE_METAL_NODE,    // solid ore chunk; clusters on metal fields
+    TILE_COAL_NODE,     // solid coal chunk; clusters on coal fields
     TILE_WALL,          // player-built stone wall
     TILE_METAL_WALL,    // much tougher wall (DEFENSE tech)
     TILE_DOOR,          // YOU can walk through it; mobs can't
     TILE_CHEST,         // item storage machine
     TILE_DRILL,         // auto-mines adjacent rocks/trees
     TILE_CONVEYOR,      // moves items along its direction
+    TILE_CONVEYOR_CORNER, // same, but drawn as a 90° turn (4 rotations)
     TILE_INSERTER,      // robotic hand: moves items between neighbors
     TILE_TURRET,        // shoots bullets at mobs (needs ammo)
     TILE_LASER_TURRET,  // zaps mobs, no ammo, slower
@@ -65,6 +69,7 @@ typedef enum {
     ITEM_DRILL,           // places TILE_DRILL
     ITEM_CHEST,           // places TILE_CHEST
     ITEM_CONVEYOR,        // places TILE_CONVEYOR (R rotates)
+    ITEM_CONVEYOR_CORNER, // places TILE_CONVEYOR_CORNER (R rotates)
     ITEM_INSERTER,        // places TILE_INSERTER (R rotates)
     ITEM_MINING_BOT,      // deploys an autonomous mining drone
     ITEM_TURRET,          // places TILE_TURRET
@@ -164,6 +169,7 @@ static ItemInfo ITEMS[ITEM_COUNT] = {
     [ITEM_DRILL]        = { "Mining Drill",(Color){185,145, 60,255}, 0,  TILE_DRILL, true,      ITEM_METAL,      8, ITEM_STONE,   4, 1, TECH_AUTOMATION },
     [ITEM_CHEST]        = { "Chest",       (Color){170,130, 60,255}, 0,  TILE_CHEST, true,      ITEM_WOOD,       6, ITEM_METAL,   2, 1, TECH_AUTOMATION },
     [ITEM_CONVEYOR]     = { "Conveyor",    (Color){190,170, 60,255}, 0,  TILE_CONVEYOR, true,   ITEM_METAL,      2, ITEM_RUBBER,  1, 2, TECH_LOGISTICS },
+    [ITEM_CONVEYOR_CORNER] = { "Belt Corner", (Color){205,150, 55,255}, 0, TILE_CONVEYOR_CORNER, true, ITEM_METAL, 2, ITEM_RUBBER, 1, 2, TECH_LOGISTICS },
     [ITEM_INSERTER]     = { "Inserter",    (Color){225,160, 50,255}, 0,  TILE_INSERTER, true,   ITEM_METAL,      3, ITEM_RUBBER,  1, 1, TECH_LOGISTICS },
     [ITEM_MINING_BOT]   = { "Mining Bot",  (Color){ 80,200,220,255}, 0,  TILE_GRASS, false,     ITEM_METAL,     12, ITEM_RUBBER,  6, 1, TECH_ROBOTICS },
     [ITEM_TURRET]       = { "Gun Turret",  (Color){150,150,165,255}, 0,  TILE_TURRET, true,     ITEM_METAL,     10, ITEM_STONE,   5, 1, TECH_DEFENSE },
@@ -190,12 +196,18 @@ static TileInfo TILES[TILE_COUNT] = {
     [TILE_GRASS]        = { "Grass",         (Color){ 40,150, 60,255},  1,   ITEM_NONE,                0, false, true  },
     [TILE_TREE]         = { "Tree",          (Color){ 90, 60, 30,255},  4,   ITEM_WOOD,               10, true,  false },
     [TILE_ROCK]         = { "Rock",          (Color){ 80, 80, 90,255},  8,   ITEM_STONE,              10, true,  false },
+    [TILE_SULFUR_NODE]  = { "Sulfur Node",   (Color){198,178, 44,255}, 14,   ITEM_SULFUR_ORE,          3, true,  false },
+    [TILE_METAL_NODE]   = { "Metal Node",    (Color){146,152,190,255}, 16,   ITEM_METAL_ORE,           3, true,  false },
+    [TILE_COAL_NODE]    = { "Coal Node",     (Color){ 52, 50, 56,255}, 12,   ITEM_COAL,                4, true,  false },
     [TILE_WALL]         = { "Wall",          (Color){170,170,180,255}, 12,   ITEM_STONE,               1, true,  false },
     [TILE_METAL_WALL]   = { "Metal Wall",    (Color){150,150,170,255}, 45,   ITEM_METAL,               1, true,  false },
     [TILE_DOOR]         = { "Door",          (Color){150,100, 55,255}, 10,   ITEM_DOOR,                1, true,  false },
     [TILE_CHEST]        = { "Chest",         (Color){120, 90, 45,255}, 12,   ITEM_CHEST,               1, true,  false },
     [TILE_DRILL]        = { "Mining Drill",  (Color){110, 95, 55,255}, 16,   ITEM_DRILL,               1, true,  false },
-    [TILE_CONVEYOR]     = { "Conveyor",      (Color){ 70, 70, 60,255},  6,   ITEM_CONVEYOR,            1, true,  true  },
+    // Belts are deliberately flimsy — a tap picks one back up, so
+    // re-routing a line is fast instead of a chore.
+    [TILE_CONVEYOR]     = { "Conveyor",      (Color){ 70, 70, 60,255},  1,   ITEM_CONVEYOR,            1, true,  true  },
+    [TILE_CONVEYOR_CORNER] = { "Belt Corner",(Color){ 74, 68, 58,255},  1,   ITEM_CONVEYOR_CORNER,     1, true,  true  },
     [TILE_INSERTER]     = { "Inserter",      (Color){ 95, 75, 40,255},  6,   ITEM_INSERTER,            1, true,  false },
     [TILE_TURRET]       = { "Gun Turret",    (Color){ 90, 90,100,255}, 22,   ITEM_TURRET,              1, true,  false },
     [TILE_LASER_TURRET] = { "Laser Turret",  (Color){110, 70, 70,255}, 22,   ITEM_LASER_TURRET,        1, true,  false },
@@ -215,11 +227,21 @@ static void RollTileBreakDrops(TileType before, int out[ITEM_COUNT]) {
         return;
     }
     if (before == TILE_ROCK) {
-        // Rocks always give stone, then roll three independent ore chances.
+        // Rocks always give stone, then roll independent ore chances.
+        // Coal is common on purpose now — every drill and inserter
+        // burns it, so the fuel economy has to keep up.
         out[ITEM_STONE] += TILES[before].dropCount;
-        if (GetRandomValue(1, 100) <= 70) out[ITEM_COAL] += 1;
+        out[ITEM_COAL]  += GetRandomValue(1, 3);
         if (GetRandomValue(1, 100) <= 45) out[ITEM_SULFUR_ORE] += 1;
         if (GetRandomValue(1, 100) <= 35) out[ITEM_METAL_ORE] += 1;
+        return;
+    }
+    if (before == TILE_SULFUR_NODE || before == TILE_METAL_NODE ||
+        before == TILE_COAL_NODE) {
+        // Ore nodes are the rich strike: a fat pile of their ore
+        // plus a little stone shell.
+        out[TILES[before].drops] += TILES[before].dropCount + GetRandomValue(0, 3);
+        out[ITEM_STONE] += GetRandomValue(1, 2);
         return;
     }
     // Anything else: exactly what the table says.
@@ -374,15 +396,15 @@ static const ItemArt ITEM_ART[ITEM_COUNT] = {
         "..oblo..",
         "..oddo..",
         "...oo..." } },
-    [ITEM_PICKAXE] = { { 130, 130, 140, 255 }, {  // stone head, wood handle
-        ".oooooo.",
-        "osssstso",
-        "oto..oto",
+    [ITEM_PICKAXE] = { { 130, 130, 140, 255 }, {  // slanted: head high-left,
+        "oso.....",                               // haft running down-right
+        "ossto...",
+        ".otsto..",
         "..obdo..",
-        "..obdo..",
-        "..obdo..",
-        "..obdo..",
-        "...oo..." } },
+        "...obdo.",
+        "....obdo",
+        "....obdo",
+        ".....oo." } },
     [ITEM_SLINGSHOT] = { { 50, 45, 40, 255 }, { // Y-fork with band
         ".o....o.",
         "obs..sbo",
@@ -428,15 +450,15 @@ static const ItemArt ITEM_ART[ITEM_COUNT] = {
         ".odddddo",
         "..oooo..",
         "........" } },
-    [ITEM_DRILL] = { { 140, 140, 150, 255 }, {  // housing + drill bit
+    [ITEM_DRILL] = { { 140, 140, 150, 255 }, {  // squared housing, bit inset
         "oooooooo",
         "obbbbbdo",
-        "obddbbdo",
-        ".oooooo.",
-        "..osso..",
-        "..otso..",
-        "...ot...",
-        "....o..." } },
+        "oblbbbdo",
+        "obosstdo",
+        "obosstdo",
+        "obbbbbdo",
+        "obdddddo",
+        "oooooooo" } },
     [ITEM_CHEST] = { { 150, 150, 160, 255 }, {  // wood chest, metal band
         "........",
         ".oooooo.",
@@ -455,6 +477,15 @@ static const ItemArt ITEM_ART[ITEM_COUNT] = {
         "otbtbtbo",
         "oooooooo",
         "........" } },
+    [ITEM_CONVEYOR_CORNER] = { { 70, 70, 75, 255 }, {  // belt bending right
+        "oooooooo",
+        "otbtbtbo",
+        "obtbtbbo",
+        "otbtbboo",
+        "obtbbo..",
+        "otbbo...",
+        "obbo....",
+        "oo......" } },
     [ITEM_INSERTER] = { { 150, 150, 160, 255 }, {  // claw, arm, base
         "...oo...",
         "..otto..",
@@ -473,24 +504,24 @@ static const ItemArt ITEM_ART[ITEM_COUNT] = {
         "..o..o..",
         ".s.ss.s.",
         "........" } },
-    [ITEM_TURRET] = { { 90, 90, 95, 255 }, {    // barrel up, armored base
-        "...oo...",
-        "..obdo..",
-        "..obdo..",
-        ".oooooo.",
+    [ITEM_TURRET] = { { 90, 90, 95, 255 }, {    // boxy bunker, short barrel
+        "..osso..",
+        "..osso..",
+        "oooooooo",
         "obbbbbdo",
-        "obddbbdo",
-        ".oooooo.",
-        "........" } },
-    [ITEM_LASER_TURRET] = { { 90, 90, 95, 255 }, {  // glowing lens up top
-        "...oo...",
+        "oblbbbdo",
+        "obbbbbdo",
+        "obdddddo",
+        "oooooooo" } },
+    [ITEM_LASER_TURRET] = { { 90, 90, 95, 255 }, {  // boxy, glowing emitter
         "..owwo..",
-        "..obdo..",
-        ".oooooo.",
+        "..osso..",
+        "oooooooo",
         "obbbbbdo",
-        "obddbbdo",
-        ".oooooo.",
-        "........" } },
+        "oblbwbdo",
+        "obbbbbdo",
+        "obdddddo",
+        "oooooooo" } },
     [ITEM_RESEARCH_COMPUTER] = { { 80, 220, 230, 255 }, {  // screen + keys
         ".oooooo.",
         "osssssdo",
@@ -605,6 +636,115 @@ static void DrawItemSpriteRot(ItemID id, Vector2 center, float size, float rotat
             DrawRectanglePro((Rectangle){ center.x, center.y, px + 0.5f, px + 0.5f },
                              (Vector2){ -off.x, -off.y }, rotationDeg, c);
         }
+    }
+}
+
+// ─── Weapons ──────────────────────────────────────────────
+// Rank doubles as "is this a weapon": 0 means no. Higher = better,
+// which is what the Q quick-draw key uses to pick your best gun.
+static int ItemWeaponRank(ItemID id) {
+    switch (id) {
+        case ITEM_SLINGSHOT: return 1;
+        case ITEM_PISTOL:    return 2;
+        case ITEM_SHOTGUN:   return 3;
+        case ITEM_SMG:       return 4;
+        default:             return 0;
+    }
+}
+
+static bool ItemIsWeapon(ItemID id) { return ItemWeaponRank(id) > 0; }
+
+// ─── Magazines & reloading ────────────────────────────────
+// A weapon fires from a MAGAZINE. Empty it and the gun reloads
+// itself from your bullet stack, which takes time — that's the
+// window the mobs are counting on. 0 = no magazine (the slingshot
+// feeds straight from the stone pile).
+static int ItemMagSize(ItemID id) {
+    switch (id) {
+        case ITEM_PISTOL:  return 12;
+        case ITEM_SMG:     return 30;
+        case ITEM_SHOTGUN: return 6;
+        default:           return 0;
+    }
+}
+
+static float ItemReloadTime(ItemID id) {
+    switch (id) {
+        case ITEM_PISTOL:  return 1.1f;
+        case ITEM_SMG:     return 1.9f;
+        case ITEM_SHOTGUN: return 2.3f;
+        default:           return 0.0f;
+    }
+}
+
+// Which item does this weapon feed on?
+static ItemID ItemAmmoFor(ItemID id) {
+    if (id == ITEM_SLINGSHOT) return ITEM_SMALL_STONE;
+    if (ItemMagSize(id) > 0)  return ITEM_BULLET;
+    return ITEM_NONE;
+}
+
+// ─── Crafting time ────────────────────────────────────────
+// Nothing is instant any more: every recipe takes real seconds,
+// derived from how much it consumes so the table stays the single
+// source of truth (a pricier recipe is automatically a slower one).
+// A few landmark builds get an explicit, longer time.
+static float ItemCraftTime(ItemID id) {
+    if (id <= ITEM_NONE || id >= ITEM_COUNT) return 0.5f;
+    switch (id) {
+        case ITEM_PISTOL:       return 3.0f;
+        case ITEM_SMG:          return 4.5f;
+        case ITEM_SHOTGUN:      return 4.0f;
+        case ITEM_MINING_BOT:   return 6.0f;
+        case ITEM_LASER_TURRET: return 6.0f;
+        case ITEM_TURRET:       return 4.0f;
+        case ITEM_RESEARCH_COMPUTER: return 5.0f;
+        case ITEM_DRILL:        return 3.5f;
+        case ITEM_BOMB:         return 2.0f;
+        default: break;
+    }
+    const ItemInfo *it = &ITEMS[id];
+    float t = 0.35f + 0.05f * (float)(it->nA + it->nB);
+    if (t > 4.0f) t = 4.0f;
+    return t;
+}
+
+// ─── Tile family helpers ──────────────────────────────────
+// Both belt kinds behave identically in the logistics code; only
+// their drawing differs. One predicate keeps that honest.
+static bool TileIsBelt(TileType t) {
+    return t == TILE_CONVEYOR || t == TILE_CONVEYOR_CORNER;
+}
+
+// Machines that hold state, burn fuel, or store items — i.e. the
+// ones that get a Machine record and a UI.
+static bool TileIsMachine(TileType t) {
+    return t == TILE_CHEST || t == TILE_DRILL || TileIsBelt(t) ||
+           t == TILE_INSERTER || t == TILE_TURRET || t == TILE_LASER_TURRET ||
+           t == TILE_RESEARCH;
+}
+
+// Machines whose facing matters — R rotates these in place.
+// Drills are directional too: they spit their output onto whatever
+// sits in FRONT of them, so a drill can feed a belt with no arm.
+static bool TileIsDirectional(TileType t) {
+    return TileIsBelt(t) || t == TILE_INSERTER || t == TILE_DRILL;
+}
+
+// Machines that run on coal.
+static bool TileNeedsFuel(TileType t) {
+    return t == TILE_DRILL || t == TILE_INSERTER;
+}
+
+// Seconds between shots when you CLICK. Holding the button fires
+// slightly slower (see WEAPON_HOLD_PENALTY in config.h).
+static float ItemFireInterval(ItemID id) {
+    switch (id) {
+        case ITEM_SMG:       return SMG_FIRE_INTERVAL;
+        case ITEM_PISTOL:    return 0.22f;
+        case ITEM_SHOTGUN:   return 0.65f;
+        case ITEM_SLINGSHOT: return 0.40f;
+        default:             return 0.25f;
     }
 }
 

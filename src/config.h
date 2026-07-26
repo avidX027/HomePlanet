@@ -22,7 +22,7 @@
 #define TARGET_FPS     60
 
 // ─── World ────────────────────────────────────────────────
-#define WORLD_SIZE     384         // world is WORLD_SIZE x WORLD_SIZE tiles
+#define WORLD_SIZE     640         // world is WORLD_SIZE x WORLD_SIZE tiles
 #define TILE_SIZE      24          // pixels per tile (between the old chunky
                                    // 30 and Factorio's fine grain)
 #define TREE_CHANCE    2           // % of MEADOW tiles that start as trees
@@ -30,12 +30,28 @@
 #define SPAWN_CLEAR_RADIUS 9       // obstacle-free tiles around the player spawn
 // Enemy territory: a few BIG infestation patches far from spawn
 // (like biter bases), not an edge ring.
-#define INFESTATION_PATCHES 6      // how many enemy patches to scatter
+#define INFESTATION_PATCHES 10     // how many enemy patches to scatter
 #define INFESTATION_RADIUS  14     // patch radius in tiles
 #define FOW_REVEAL_TILES    26     // fog-of-war reveal radius around you
+#define DAY_LENGTH_SECONDS  480.0f // one in-game day; shadows swing around it
+// Ore fields, Factorio-style: colored ground patches; drills placed
+// ON them pump ore forever, and solid ore NODES cluster on/near them.
+#define ORE_SULFUR_PATCHES  16     // sulfur fields scattered on the map
+#define ORE_METAL_PATCHES   18     // metal fields
+#define ORE_COAL_PATCHES    20     // coal fields — the fuel economy needs them
+#define ORE_PATCH_RADIUS_MIN 4     // patches vary in size (tiles)
+#define ORE_PATCH_RADIUS_MAX 9
+#define ORE_NODE_CHANCE      7     // % per patch tile to grow a solid node
+
+// ─── Inventory & logistics ────────────────────────────────
+#define STACK_MAX           100    // items per slot, player and machines
+#define BELT_CAPACITY       4      // items one belt tile can carry at once
+#define BELT_CARRY_SPEED    95.0f  // px/s a belt drags anything standing on it
+#define COAL_FUEL_SECONDS   30.0f  // run-time one coal buys a machine
+#define MACHINE_FUEL_MAX    5      // coal a machine can hold at once
 
 // ─── Player ─────────────────────────────────────────────────
-#define PLAYER_SPEED   360.0f      // pixels per second (~15 tiles/s)
+#define PLAYER_SPEED   330.0f      // pixels per second (~14 tiles/s)
 #define PLAYER_RADIUS  7.0f        // size of the player circle
 #define PLAYER_REACH   70.0f       // max distance (px) you can mine/place
 #define SLINGSHOT_REACH 280.0f      // slingshot shoots FAR now
@@ -48,9 +64,13 @@
 #define PLAYER_MAX_HP       100.0f      // you can die now — build a base!
 #define SMG_FIRE_INTERVAL   0.12f       // seconds between SMG shots (hold LMB)
 #define SHOTGUN_PELLETS     6           // pellets per shotgun blast
+// Every weapon auto-fires while you HOLD the button, but a touch
+// slower than clicking — click-spam stays the skill ceiling.
+#define WEAPON_HOLD_PENALTY 1.25f
+#define UNARMED_SPEED_BONUS 1.07f       // hands free → run a bit faster
 
 // ─── Mobs & waves (Factorio-style escalation) ─────────────
-#define MOB_BASE_HP         22.0f       // mob health at evolution 0 (scales up)
+#define MOB_BASE_HP         11.0f       // mob health at evolution 0 (scales up)
 #define MOB_SPEED           95.0f       // mob walk speed, px/s
 #define MOB_CONTACT_DPS     12.0f       // damage/second touching the player
 #define MOB_CHEW_DPS        6.0f        // damage/second gnawing walls/machines

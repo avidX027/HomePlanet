@@ -74,15 +74,20 @@ static UIButton settingsBackButton  = { 0 };
 // The controls reference shown in Settings. One table, so adding a
 // binding means adding ONE row here — the menu sizes itself.
 static const struct { const char *keys; const char *action; } CONTROLS[] = {
-    { "W A S D",      "Move" },
-    { "Left click",   "Mine / shoot" },
-    { "Right click",  "Place / interact (chest, turret, research)" },
+    { "W A S D",      "Move (works with menus open)" },
+    { "Left click",   "Build (holding a block) / mine / shoot" },
+    { "Right click",  "Open block panels; in crafting, craft 5" },
+    { "Q",            "Close menus, draw / cycle weapons" },
+    { "Z (drag)",     "Feed coal to drills / inserters" },
+    { "F (hold)",     "Pull items off nearby belts" },
+    { "Drag / Ctrl+click", "Move stacks between any open panels" },
     { "Mouse wheel",  "Cycle hotbar" },
     { "Ctrl + wheel", "Zoom camera" },
     { "1 - 7",        "Select hotbar slot" },
     { "E",            "Backpack" },
     { "TAB",          "Crafting" },
-    { "R",            "Rotate conveyor / inserter" },
+    { "Arrow keys",   "Navigate menus" },
+    { "R",            "Reload gun; else rotate belt/arm or ghost" },
     { "G (hold)",     "World map" },
     { "F3",           "Debug console" },
     { "F5 / F9",      "Quick save / quick load" },
@@ -93,8 +98,13 @@ static const struct { const char *keys; const char *action; } CONTROLS[] = {
 // (The Projectile pool moved to entities.h — turrets fire the same
 // projectiles the player does, so the pool lives with the turrets.)
 
-// Weapon fire-rate state: counts down between automatic SMG shots.
-static float smgCooldown = 0;
+// Weapon fire-rate state: counts down between shots of whatever
+// you're holding (all weapons auto-fire while the button is held).
+static float weaponCooldown = 0;
+// Last tile the Z-drag fuel sweep touched, as ty*WORLD_SIZE+tx.
+// -1 = no drag in progress. This is what makes coal feeding
+// one-lump-per-machine instead of one-per-frame.
+static int   zFuelLastTile = -1;
 
 // Save files start with a tiny header so we can recognize our own
 // files and reject garbage. `char magic[4]` holds the 4 letters
@@ -105,7 +115,11 @@ typedef struct {
 } SaveHeader;
 
 #define SAVE_MAGIC "HPSV"
-#define SAVE_VERSION 3   // v3: 384 world, rock variants, fog of war
+// BUMP THIS whenever a saved struct's SIZE or LAYOUT changes —
+// including the machine pool's length. A stale block that still
+// passes the version check reads as garbage or fails halfway, and
+// the recovery path throws away state that looked fine on disk.
+#define SAVE_VERSION 6   // v6: 8192-machine pool, rage, craft queue
 
 // (CraftableCount and CraftableAtRow used to live here; they moved
 // to gamedata.h because ui.h needs them too — pure table queries
@@ -125,6 +139,10 @@ static void GiveTileBreakDrops(int tx, int ty, TileType before) {
     }
     // Mining your own chest hands back what was inside it.
     RemoveMachineAt(tx, ty, &player);
+    // Tearing down a nest by hand enrages everything nearby.
+    if (before == TILE_SPAWNER) {
+        EnrageMobsAround((Vector2){ (tx + 0.5f) * TILE_SIZE, (ty + 0.5f) * TILE_SIZE });
+    }
 }
 
 // ─── Save-file hygiene ───────────────────────────────────────
@@ -189,17 +207,11 @@ static void ValidateLoadedPlayer(Player *p) {
         if (p->craftScroll >= craftCount) p->craftScroll = craftCount - 1;
     }
 
-    // Recompute `selected` (the item in hand) from the slot data
-    // instead of trusting the saved value — derived state should
-    // always be derived, never loaded.
-    ItemID selectedId = ITEM_NONE;
-    if (p->selectedSlot >= 0 && p->selectedSlot < HOTBAR_MAX_SLOTS) {
-        ItemID slotId = p->inventorySlots[p->selectedSlot];
-        if (slotId != ITEM_NONE && p->inventoryAmounts[p->selectedSlot] > 0) {
-            selectedId = slotId;
-        }
-    }
-    p->selected = selectedId;
+    // Rebuild every derived value (item totals, `selected`, the
+    // hotbar mirror) from the slots, and scrub any 0x ghosts the
+    // file may carry. Derived state is never loaded, only recomputed
+    // — that's what stops a hand-edited save from inventing items.
+    PlayerRecount(p);
 
     // Survival + research state back into legal ranges.
     if (p->hp <= 0 || p->hp > PLAYER_MAX_HP) p->hp = PLAYER_MAX_HP;
@@ -207,6 +219,33 @@ static void ValidateLoadedPlayer(Player *p) {
     p->invulnTimer = 0;
     p->regenDelay = 0;
     p->placeDir &= 3;
+
+    // Magazines can't exceed their weapon's capacity, and a reload
+    // never survives a load.
+    for (int i = 0; i < ITEM_COUNT; i++) {
+        int cap = ItemMagSize((ItemID)i);
+        if (p->mag[i] < 0)   p->mag[i] = 0;
+        if (p->mag[i] > cap) p->mag[i] = cap;
+    }
+    p->reloadTimer = 0;
+    p->reloadTotal = 0;
+    p->reloadingItem = ITEM_NONE;
+    machineUiX = machineUiY = -1;   // no panel open across a load
+
+    // A craft queue from disk is untrusted: clamp its length and
+    // drop any entry that isn't a real recipe.
+    if (p->craftQueueCount < 0 || p->craftQueueCount > CRAFT_QUEUE_MAX) p->craftQueueCount = 0;
+    int keep = 0;
+    for (int i = 0; i < p->craftQueueCount; i++) {
+        ItemID q = p->craftQueue[i];
+        if (q > ITEM_NONE && q < ITEM_COUNT && ITEMS[q].inA != ITEM_NONE) {
+            p->craftQueue[keep++] = q;
+        }
+    }
+    p->craftQueueCount = keep;
+    for (int i = keep; i < CRAFT_QUEUE_MAX; i++) p->craftQueue[i] = ITEM_NONE;
+    if (p->craftProgress < 0) p->craftProgress = 0;
+    for (int i = 0; i < MAX_TOASTS; i++) playerToasts[i].active = false;
     if (p->techSel < 0 || p->techSel >= TECH_COUNT - 1) p->techSel = 0;
     if (p->techScroll < 0 || p->techScroll >= TECH_COUNT - 1) p->techScroll = 0;
 
@@ -340,74 +379,122 @@ static void UpdateMiningAndPlacing(float dt) {
     // Check placement bounds — never index world[][] out of range.
     if (tx < 0 || tx >= WORLD_SIZE || ty < 0 || ty >= WORLD_SIZE) return;
 
-    // ── Weapons FIRST, before any reach check ────────────────
-    // Weapons fire toward the cursor 100% of the time — where you
-    // CLICK is a direction, not a destination. (The old code ran
-    // the reach gate first, so clicking past your reach silently
-    // ate the shot. That was the "sometimes nothing fires" bug.)
     ItemID held = player.selected;
     Vector2 muzzle = Vector2Add(player.pos,
         Vector2Scale(Vector2Normalize(Vector2Subtract(mouse, player.pos)), PLAYER_RADIUS + 8));
+    TileType hoverTile = world[tx][ty].type;
+    bool inReach = Vector2Distance(player.pos, mouse) <= TUNE.playerReach;
 
-    if (held == ITEM_SLINGSHOT) {
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && player.inventory[ITEM_SMALL_STONE] > 0) {
-            PlayerRemoveItem(&player, ITEM_SMALL_STONE, 1);   // ammo is consumed...
-            SpawnProjectile(player.pos, mouse, ITEM_SMALL_STONE, false);  // ...and flies
-            AddEffect(EFFECT_FLASH, muzzle, 5, 0.05f);
-        }
-        return;
-    }
-    if (held == ITEM_PISTOL) {
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && player.inventory[ITEM_BULLET] > 0) {
-            PlayerRemoveItem(&player, ITEM_BULLET, 1);
-            SpawnProjectile(player.pos, mouse, ITEM_BULLET, false);
-            AddEffect(EFFECT_FLASH, muzzle, 7, 0.06f);
-            entShake += 0.8f;
-        }
-        return;
-    }
-    if (held == ITEM_SMG) {
-        // Full auto: fires as long as LMB is DOWN, one bullet per
-        // SMG_FIRE_INTERVAL. The cooldown ticks in UpdateGame.
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && smgCooldown <= 0 &&
-            player.inventory[ITEM_BULLET] > 0) {
-            PlayerRemoveItem(&player, ITEM_BULLET, 1);
-            // A pinch of recoil spread so it feels like an SMG.
-            Vector2 spread = Vector2Rotate(Vector2Subtract(mouse, player.pos),
-                                           GetRandomValue(-40, 40) / 1000.0f);
-            SpawnProjectile(player.pos, Vector2Add(player.pos, spread), ITEM_BULLET, false);
-            AddEffect(EFFECT_FLASH, muzzle, 6, 0.05f);
-            entShake += 0.35f;
-            smgCooldown = SMG_FIRE_INTERVAL;
-        }
-        return;
-    }
-    if (held == ITEM_SHOTGUN) {
-        // One trigger pull → a fan of pellets, 2 bullets of ammo.
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && player.inventory[ITEM_BULLET] >= 2) {
-            PlayerRemoveItem(&player, ITEM_BULLET, 2);
-            for (int pellet = 0; pellet < SHOTGUN_PELLETS; pellet++) {
-                Vector2 spread = Vector2Rotate(Vector2Subtract(mouse, player.pos),
-                                               GetRandomValue(-140, 140) / 1000.0f);
-                SpawnProjectile(player.pos, Vector2Add(player.pos, spread), ITEM_BULLET, false);
-            }
-            AddEffect(EFFECT_FLASH, muzzle, 10, 0.08f);
-            entShake += 2.6f;
-        }
-        return;
-    }
-
-    // ── Everything below (mine, place, interact) needs REACH ──
-    if (Vector2Distance(player.pos, mouse) > TUNE.playerReach) return;
-
-    // ── RMB interactions (Pressed = deliberate single actions) ──
-    TileType targetTile = world[tx][ty].type;
-    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-        // Research computer → open the tech tree.
-        if (targetTile == TILE_RESEARCH) {
+    // ── Machine access comes FIRST, weapon or no weapon ──────
+    // Opening a chest or a drill shouldn't require holstering your
+    // gun, so these run before the weapon block.
+    if (inReach && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        if (hoverTile == TILE_RESEARCH) {
             PlayerToggleTechMenu(&player);
             return;
         }
+        // Chest, drill, inserter, belt → open its panel.
+        if (hoverTile == TILE_CHEST || TileNeedsFuel(hoverTile) || TileIsBelt(hoverTile)) {
+            if (MachineAt(tx, ty) != NULL) {
+                if (machineUiX == tx && machineUiY == ty) {
+                    machineUiX = machineUiY = -1;    // same tile → close
+                } else {
+                    machineUiX = tx; machineUiY = ty;
+                    player.techMenuOpen = false;
+                }
+                return;
+            }
+        }
+    }
+
+    // ── Z: drag-feed coal, Factorio style ────────────────────
+    // Hold Z with coal in hand and sweep the cursor over machines:
+    // each NEW machine tile the cursor touches takes exactly one
+    // lump. `zFuelLastTile` is what makes it one-per-touch instead
+    // of one-per-frame.
+    if (IsKeyDown(KEY_Z) && player.inventory[ITEM_COAL] > 0 && inReach) {
+        int tile = ty * WORLD_SIZE + tx;
+        if (tile != zFuelLastTile && TileNeedsFuel(hoverTile)) {
+            Machine *m = MachineAt(tx, ty);
+            if (m != NULL && MachineAddCoal(m)) {
+                PlayerRemoveItem(&player, ITEM_COAL, 1);
+                zFuelLastTile = tile;
+            }
+        } else if (tile != zFuelLastTile && !TileNeedsFuel(hoverTile)) {
+            zFuelLastTile = tile;   // passing over scenery re-arms the drag
+        }
+    } else if (!IsKeyDown(KEY_Z)) {
+        zFuelLastTile = -1;
+    }
+
+    // ── Weapons: fire toward the cursor, no reach gate ────────
+    // Where you CLICK is a direction, not a destination. (The old
+    // code ran the reach gate first, so clicking past your reach
+    // silently ate the shot — the "nothing fires" bug.)
+    if (ItemIsWeapon(held)) {
+        // EVERY weapon auto-fires while held. Clicking fires at the
+        // weapon's full rate; holding runs WEAPON_HOLD_PENALTY times
+        // slower, so click-spam stays marginally better than leaning
+        // on the button.
+        bool clicked = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+        bool holding = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        int magSize = ItemMagSize(held);
+
+        if ((clicked || holding) && weaponCooldown <= 0 && player.reloadTimer <= 0) {
+            float interval = ItemFireInterval(held);
+            if (!clicked) interval *= WEAPON_HOLD_PENALTY;
+
+            // Magazine guns burn a loaded round; the slingshot feeds
+            // straight from your stone pile.
+            int shotCost = (held == ITEM_SHOTGUN) ? 2 : 1;
+            bool haveShot = (magSize > 0) ? (player.mag[held] >= shotCost)
+                                          : (player.inventory[ITEM_SMALL_STONE] > 0);
+
+            if (!haveShot) {
+                PlayerStartReload(&player, held);   // dry → rack a fresh mag
+            } else {
+                if (magSize > 0) player.mag[held] -= shotCost;
+
+                if (held == ITEM_SLINGSHOT) {
+                    PlayerRemoveItem(&player, ITEM_SMALL_STONE, 1);   // ammo consumed...
+                    SpawnProjectile(player.pos, mouse, ITEM_SMALL_STONE, false);  // ...and flies
+                    AddEffect(EFFECT_FLASH, muzzle, 5, 0.05f);
+                } else if (held == ITEM_PISTOL) {
+                    SpawnProjectile(player.pos, mouse, ITEM_BULLET, false);
+                    AddEffect(EFFECT_FLASH, muzzle, 7, 0.06f);
+                    entShake += 0.8f;
+                } else if (held == ITEM_SMG) {
+                    // A pinch of recoil spread so it feels like an SMG.
+                    Vector2 spread = Vector2Rotate(Vector2Subtract(mouse, player.pos),
+                                                   GetRandomValue(-40, 40) / 1000.0f);
+                    SpawnProjectile(player.pos, Vector2Add(player.pos, spread), ITEM_BULLET, false);
+                    AddEffect(EFFECT_FLASH, muzzle, 6, 0.05f);
+                    entShake += 0.35f;
+                } else if (held == ITEM_SHOTGUN) {
+                    for (int pellet = 0; pellet < SHOTGUN_PELLETS; pellet++) {
+                        Vector2 spread = Vector2Rotate(Vector2Subtract(mouse, player.pos),
+                                                       GetRandomValue(-140, 140) / 1000.0f);
+                        SpawnProjectile(player.pos, Vector2Add(player.pos, spread), ITEM_BULLET, false);
+                    }
+                    AddEffect(EFFECT_FLASH, muzzle, 10, 0.08f);
+                    entShake += 2.6f;
+                }
+                weaponCooldown = interval;
+                // Ran the mag dry with that shot → start reloading now.
+                if (magSize > 0 && player.mag[held] < shotCost) {
+                    PlayerStartReload(&player, held);
+                }
+            }
+        }
+        return;   // holding a weapon: no mining/placing with this click
+    }
+
+    // ── Everything below (mine, place) needs REACH ────────────
+    if (!inReach) return;
+
+    // ── RMB interactions (Pressed = deliberate single actions) ──
+    TileType targetTile = hoverTile;
+    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
         // Turret + bullets in hand → load 10.
         if (targetTile == TILE_TURRET && held == ITEM_BULLET) {
             Machine *m = MachineAt(tx, ty);
@@ -415,22 +502,6 @@ static void UpdateMiningAndPlacing(float dt) {
                 int load = player.inventory[ITEM_BULLET] < 10 ? player.inventory[ITEM_BULLET] : 10;
                 PlayerRemoveItem(&player, ITEM_BULLET, load);
                 m->ammo += load;
-            }
-            return;
-        }
-        // Chest/drill: empty hand withdraws everything; holding a
-        // (non-placeable) item deposits that stack.
-        if (targetTile == TILE_CHEST || targetTile == TILE_DRILL) {
-            Machine *m = MachineAt(tx, ty);
-            if (m != NULL) {
-                if (held == ITEM_NONE) {
-                    MachineGiveContentsTo(m, &player);
-                } else if (targetTile == TILE_CHEST && !ITEMS[held].placeable &&
-                           player.inventory[held] > 0) {
-                    int amount = player.inventory[held];
-                    if (MachineAddItem(m, held, amount) > 0)
-                        PlayerRemoveItem(&player, held, amount);
-                }
             }
             return;
         }
@@ -448,48 +519,100 @@ static void UpdateMiningAndPlacing(float dt) {
         }
     }
 
-    // LMB (held): damage the tile; collect drops if it broke.
-    // DPS * dt = damage this frame — same dt trick as movement, so
-    // mining speed is identical at 30fps and 144fps.
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+    // LMB (held) with a PLACEABLE in hand = build; otherwise = mine.
+    // Holding a belt means you're building a belt, so left-click
+    // lays track instead of digging. Put the belt away (empty hand
+    // or a tool) and the same button mines again.
+    bool holdingPlaceable = (held != ITEM_NONE && ITEMS[held].placeable &&
+                             player.inventory[held] > 0);
+
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !holdingPlaceable) {
         TileType before = world[tx][ty].type;   // capture BEFORE it breaks
         if (WorldDamageTile(tx, ty, PlayerMiningDPS(&player) * dt)) {
             GiveTileBreakDrops(tx, ty, before);
         }
     }
 
-    // RMB (held): place the selected item continuously while dragging.
-    if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+    // Build on LMB (held, so you can drag out a whole belt line).
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && holdingPlaceable) {
         const ItemInfo *it = &ITEMS[player.selected];
+        // Never build on the tile you're standing in — that used to
+        // seal you inside your own wall. (PlayerUnstick would dig
+        // you out, but refusing the placement is the honest fix.)
+        Rectangle targetTile = { (float)(tx * TILE_SIZE), (float)(ty * TILE_SIZE),
+                                 (float)TILE_SIZE, (float)TILE_SIZE };
+        bool standingHere = CheckCollisionCircleRec(player.pos, PLAYER_RADIUS + 1.0f, targetTile);
+
         if (it->placeable &&                          // is this item placeable at all?
             player.selected != ITEM_NONE &&           // holding something?
             player.inventory[player.selected] > 0 &&  // actually own one?
+            !standingHere &&                          // not under your own feet
             world[tx][ty].type == TILE_GRASS) {       // only build on open ground
-            WorldSetTile(tx, ty, it->places);         // grass → the item's tile
-            // Machines get their per-instance state (a Machine); the
-            // conveyor/inserter take the current R-rotation facing.
-            if (it->places == TILE_CHEST || it->places == TILE_DRILL ||
-                it->places == TILE_CONVEYOR || it->places == TILE_INSERTER ||
-                it->places == TILE_TURRET || it->places == TILE_LASER_TURRET ||
-                it->places == TILE_RESEARCH) {
-                AddMachineAt(tx, ty, it->places, player.placeDir);
+            // Machines need their per-instance record (a Machine) —
+            // belts/inserters/drills take the current R-rotation
+            // facing. Claim the record FIRST: if the pool is full the
+            // build is refused outright, because a machine tile with
+            // no record is a dead stub that merely looks placeable.
+            if (TileIsMachine(it->places)) {
+                if (AddMachineAt(tx, ty, it->places, player.placeDir) == NULL) return;
             }
+            WorldSetTile(tx, ty, it->places);         // grass → the item's tile
             PlayerRemoveSelectedItem(&player, 1);     // consume one from inventory
         }
     }
 }
 
+// ─── Placement ghost ─────────────────────────────────────────
+// While you HOLD a placeable item, the target tile shows a
+// translucent preview of what you're about to build, with its
+// facing arrow — so belts and inserters show which way they'll run
+// BEFORE you commit. Click (RMB) is what actually places it.
+static void DrawPlacementGhost(void) {
+    ItemID held = player.selected;
+    if (held == ITEM_NONE || !ITEMS[held].placeable) return;
+    if (player.inventory[held] <= 0) return;
+
+    Vector2 mouse = GetScreenToWorld2D(GetMousePosition(), camera);
+    int tx = (int)(mouse.x / TILE_SIZE), ty = (int)(mouse.y / TILE_SIZE);
+    if (tx < 0 || tx >= WORLD_SIZE || ty < 0 || ty >= WORLD_SIZE) return;
+
+    float px = (float)(tx * TILE_SIZE), py = (float)(ty * TILE_SIZE);
+    Rectangle tile = { px, py, (float)TILE_SIZE, (float)TILE_SIZE };
+    bool freeGround = (world[tx][ty].type == TILE_GRASS);
+    bool onSelf = CheckCollisionCircleRec(player.pos, PLAYER_RADIUS + 1.0f, tile);
+    bool reachable = Vector2Distance(player.pos, mouse) <= TUNE.playerReach;
+    bool ok = freeGround && !onSelf && reachable;
+
+    // Green = this click will build; red = it won't.
+    Color tint = ok ? (Color){ 120, 255, 140, 70 } : (Color){ 255, 90, 90, 70 };
+    DrawRectangleRec(tile, tint);
+    DrawRectangleLinesEx(tile, 2, ok ? (Color){ 150, 255, 170, 220 }
+                                     : (Color){ 255, 120, 120, 220 });
+    DrawItemSprite(held, px + 3, py + 3, TILE_SIZE - 6);
+
+    // Facing arrow for directional builds.
+    if (TileIsDirectional(ITEMS[held].places)) {
+        int d = player.placeDir;
+        Vector2 c = { px + TILE_SIZE / 2.0f, py + TILE_SIZE / 2.0f };
+        Vector2 tip  = { c.x + DIR_DX[d] * 12.0f, c.y + DIR_DY[d] * 12.0f };
+        Vector2 left = { c.x - DIR_DY[d] * 6.0f,  c.y + DIR_DX[d] * 6.0f };
+        Vector2 rght = { c.x + DIR_DY[d] * 6.0f,  c.y - DIR_DX[d] * 6.0f };
+        DrawTriangle(tip, left, rght, RAYWHITE);
+        DrawTriangle(tip, rght, left, RAYWHITE);
+    }
+}
+
 // ─── One frame of gameplay ───────────────────────────────────
-// Reading order matters here: the function is a chain of
-// "if a menu is open, handle ONLY that menu and return" blocks.
-// That's how menus pause the world without a separate pause flag —
-// the movement/mining code at the bottom simply never runs.
+// DESIGN CHANGE — menus no longer pause the world. Mobs keep
+// marching while you dig through your backpack (rust-like: the
+// world doesn't wait for you). Each open menu handles ITS input;
+// the simulation at the bottom runs every frame regardless. Menus
+// claim the MOUSE only — they navigate with the arrow keys, so
+// WASD keeps walking you around with panels open.
 static void UpdateGame(float dt) {
-    // Toggle keys work regardless of what's open. Only ONE menu can
-    // be open at a time — the player.h toggles enforce it for the
-    // backpack/crafting pair, and the debug console is closed here
-    // by hand — so pressing E inside any menu SWITCHES to the
-    // backpack instead of stacking menus on top of each other.
+    // Toggle keys. Backpack and crafting can be open TOGETHER (they
+    // sit side by side); the tech terminal and the debug console
+    // still take the stage alone.
     if (IsKeyPressed(KEY_F3)) {
         debugMenuOpen = !debugMenuOpen;
         if (debugMenuOpen) PlayerCloseMenus(&player);
@@ -497,93 +620,188 @@ static void UpdateGame(float dt) {
     if (IsKeyPressed(KEY_E))   { debugMenuOpen = false; PlayerToggleInventory(&player); }
     if (IsKeyPressed(KEY_TAB)) { debugMenuOpen = false; PlayerToggleCraftMenu(&player); }
 
-    // Escape backs out one layer at a time: an open menu closes
-    // first; with nothing open it brings up the pause screen.
+    // Q — the "back to the fight" key: slams every menu shut and
+    // draws your best weapon, or cycles to the next one if a gun is
+    // already in hand.
+    if (IsKeyPressed(KEY_Q)) {
+        debugMenuOpen = false;
+        PlayerQuickWeapon(&player);
+    }
+
+    // Escape: close whatever is open; with nothing open, pause.
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (debugMenuOpen) {
             debugMenuOpen = false;
+        } else if (machineUiX >= 0) {
+            machineUiX = machineUiY = -1;
         } else if (player.inventoryOpen || player.craftMenuOpen || player.techMenuOpen) {
             PlayerCloseMenus(&player);
         } else {
             screen = SCREEN_PAUSE;
+            return;
         }
-        return;
     }
-
-    // ── Debug console (F3) ───────────────────────────────────
-    // Open console pauses the world like the other menus. All of
-    // its OWN input (sliders, list clicks, wheel) happens inside
-    // DebugMenuDraw — see debug.h for why it's immediate-mode.
-    if (debugMenuOpen) return;
 
     // Number keys 1..N select hotbar slots. KEY_ONE + k works
     // because raylib key codes are consecutive: KEY_ONE+1 == KEY_TWO.
     for (int k = 0; k < HOTBAR_MAX_SLOTS; k++)
         if (IsKeyPressed(KEY_ONE + k)) PlayerSelectSlot(&player, k);
 
-    // ── Inventory screen (drag & drop) ───────────────────────
-    if (player.inventoryOpen) {
-        // Ask the UI module where it draws the slots, so the click
-        // detection here always matches the pixels on screen. If we
-        // duplicated the layout math, the two would drift apart.
-        InventoryLayout layout = { 0 };
-        UiGetInventoryLayout(&player, &layout);
+    // ── Drag & drop across EVERY slot surface ────────────────
+    // Backpack grid, the detached hotbar row, the HUD hotbar and any
+    // open machine panel all speak the same drag protocol: pick a
+    // stack up on press, drop it wherever you release. Each surface
+    // is hit-tested through the same rect function the drawing uses,
+    // so click targets can never drift from pixels.
+    {
+        Vector2 mouse = GetMousePosition();   // menus live in SCREEN space
+        bool panelsOpen = player.inventoryOpen || machineUiX >= 0;
 
-        // Which slot is the mouse over? Walk the grid, build each
-        // slot's rectangle, test the mouse point against it.
-        Vector2 mouse = GetMousePosition();  // menus live in SCREEN space (no camera)
-        int hoveredIndex = -1;               // -1 = "not over any slot"
-        for (int r = 0; r < INVENTORY_ROWS; r++) {
-            for (int c = 0; c < INVENTORY_COLS; c++) {
-                int idx = r * INVENTORY_COLS + c;   // 2D (row,col) → 1D index
-                int x = layout.startX + c * (layout.slotSize + layout.gap);
-                int y = layout.startY + r * (layout.slotSize + layout.gap);
-                Rectangle rect = { (float)x, (float)y, (float)layout.slotSize, (float)layout.slotSize };
-                if (CheckCollisionPointRec(mouse, rect)) {
+        InventoryLayout invLayout = { 0 };
+        bool haveInv = player.inventoryOpen;
+        if (haveInv) UiGetInventoryLayout(&player, &invLayout);
+
+        Machine *panelM = (machineUiX >= 0) ? MachineAt(machineUiX, machineUiY) : NULL;
+        MachinePanelLayout machLayout = { 0 };
+        if (panelM != NULL) UiGetMachinePanelLayout(&player, panelM, &machLayout);
+
+        // Which slot, on which surface, is under the cursor?
+        int hoverPlayer = -1, hoverMachine = -1;
+        if (haveInv) {
+            for (int idx = 0; idx < INVENTORY_SIZE; idx++) {
+                if (CheckCollisionPointRec(mouse, UiInventorySlotRect(&invLayout, idx))) {
+                    hoverPlayer = idx;
                     player.inventoryCursor = idx;
-                    hoveredIndex = idx;
+                    break;
+                }
+            }
+        }
+        if (hoverPlayer < 0 && panelsOpen) {
+            // The HUD hotbar counts as player slots 0..6 — that's
+            // what makes dragging to/from the bar work.
+            int hb = UiHotbarSlotAt(&player, mouse);
+            if (hb >= 0) hoverPlayer = hb;
+        }
+        if (panelM != NULL) {
+            for (int i = 0; i < machLayout.slotCount &&
+                            i < machLayout.cols * machLayout.rows; i++) {
+                if (CheckCollisionPointRec(mouse, UiMachineSlotRect(&machLayout, i))) {
+                    hoverMachine = i;
+                    break;
                 }
             }
         }
 
-        // Mouse DOWN on a non-empty slot: begin dragging it.
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            if (hoveredIndex >= 0 && hoveredIndex < INVENTORY_SIZE) {
-                ItemID id = player.inventorySlots[hoveredIndex];
-                if (id != ITEM_NONE && player.inventoryAmounts[hoveredIndex] > 0) {
-                    player.inventoryDragging = true;
-                    player.inventoryDragIndex = hoveredIndex;  // remember the source slot
-                    player.inventoryCursor = hoveredIndex;
+        // CTRL+CLICK — instant transfer, no dragging. A slot jumps to
+        // "the other side": your stack into the open machine, a
+        // machine stack into your pockets, and with no machine open,
+        // between the hotbar row and storage.
+        bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+        if (panelsOpen && ctrl && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            if (hoverMachine >= 0 && panelM != NULL &&
+                panelM->slots[hoverMachine] != ITEM_NONE && panelM->counts[hoverMachine] > 0) {
+                PlayerGiveItem(&player, panelM->slots[hoverMachine], panelM->counts[hoverMachine]);
+                panelM->slots[hoverMachine] = ITEM_NONE;
+                panelM->counts[hoverMachine] = 0;
+                return;
+            }
+            if (hoverPlayer >= 0 && player.inventorySlots[hoverPlayer] != ITEM_NONE &&
+                player.inventoryAmounts[hoverPlayer] > 0) {
+                if (panelM != NULL) {
+                    int put = MachineAddItem(panelM, player.inventorySlots[hoverPlayer],
+                                             player.inventoryAmounts[hoverPlayer]);
+                    if (put > 0) {
+                        player.inventoryAmounts[hoverPlayer] -= put;
+                        if (player.inventoryAmounts[hoverPlayer] <= 0) {
+                            player.inventorySlots[hoverPlayer] = ITEM_NONE;
+                            player.inventoryAmounts[hoverPlayer] = 0;
+                        }
+                        PlayerRecount(&player);
+                    }
                 } else {
-                    player.inventoryCursor = hoveredIndex;     // empty slot: just move cursor
+                    // No machine open → hop between hotbar and storage.
+                    bool fromHotbar = (hoverPlayer < HOTBAR_MAX_SLOTS);
+                    int lo = fromHotbar ? HOTBAR_MAX_SLOTS : 0;
+                    int hi = fromHotbar ? INVENTORY_SIZE : HOTBAR_MAX_SLOTS;
+                    for (int i = lo; i < hi; i++) {
+                        if (player.inventorySlots[i] == ITEM_NONE ||
+                            player.inventoryAmounts[i] <= 0) {
+                            PlayerInventorySwapSlots(&player, hoverPlayer, i);
+                            break;
+                        }
+                    }
                 }
+                return;
             }
         }
 
-        // Mouse UP while dragging: decide what the drag meant.
-        if (player.inventoryDragging && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            int from = player.inventoryDragIndex;
-            if (hoveredIndex >= 0 && hoveredIndex != from) {
-                // Dropped on a DIFFERENT slot → swap the two stacks.
-                PlayerInventorySwapSlots(&player, from, hoveredIndex);
-            } else if (from >= 0 && from < HOTBAR_MAX_SLOTS) {
-                // Dropped back where it started (or off the grid) →
-                // treat it as a plain click: a hotbar slot equips
-                // its item. (PlayerSelectSlot handles empty slots.)
-                PlayerSelectSlot(&player, from);
+        // PRESS — pick up whatever is under the cursor.
+        if (panelsOpen && !ctrl && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            if (hoverMachine >= 0 && panelM != NULL &&
+                panelM->slots[hoverMachine] != ITEM_NONE && panelM->counts[hoverMachine] > 0) {
+                uiDragKind  = DRAG_MACHINE;
+                uiDragIndex = hoverMachine;
+                uiDragItem  = panelM->slots[hoverMachine];
+                uiDragCount = panelM->counts[hoverMachine];
+            } else if (hoverPlayer >= 0 &&
+                       player.inventorySlots[hoverPlayer] != ITEM_NONE &&
+                       player.inventoryAmounts[hoverPlayer] > 0) {
+                uiDragKind  = DRAG_PLAYER;
+                uiDragIndex = hoverPlayer;
+                uiDragItem  = player.inventorySlots[hoverPlayer];
+                uiDragCount = player.inventoryAmounts[hoverPlayer];
+                player.inventoryDragging = true;          // ui.h ghost
+                player.inventoryDragIndex = hoverPlayer;
             }
-            // Either way, the drag is over.
+        }
+
+        // RELEASE — resolve the drop.
+        if (uiDragKind != DRAG_NONE && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            if (uiDragKind == DRAG_PLAYER) {
+                if (hoverPlayer >= 0 && hoverPlayer != uiDragIndex) {
+                    PlayerInventorySwapSlots(&player, uiDragIndex, hoverPlayer);
+                } else if (hoverMachine >= 0 && panelM != NULL) {
+                    // Into the machine: only what actually fits moves.
+                    int put = MachineAddItem(panelM, uiDragItem,
+                                             player.inventoryAmounts[uiDragIndex]);
+                    if (put > 0) {
+                        player.inventoryAmounts[uiDragIndex] -= put;
+                        if (player.inventoryAmounts[uiDragIndex] <= 0) {
+                            player.inventorySlots[uiDragIndex] = ITEM_NONE;
+                            player.inventoryAmounts[uiDragIndex] = 0;
+                        }
+                        PlayerRecount(&player);
+                    }
+                } else if (uiDragIndex >= 0 && uiDragIndex < HOTBAR_MAX_SLOTS &&
+                           hoverPlayer == uiDragIndex) {
+                    PlayerSelectSlot(&player, uiDragIndex);   // click = equip
+                }
+            } else if (uiDragKind == DRAG_MACHINE && panelM != NULL) {
+                if (hoverMachine >= 0 && hoverMachine != uiDragIndex) {
+                    ItemID ti = panelM->slots[hoverMachine];   // swap within the machine
+                    int    tc = panelM->counts[hoverMachine];
+                    panelM->slots[hoverMachine]  = panelM->slots[uiDragIndex];
+                    panelM->counts[hoverMachine] = panelM->counts[uiDragIndex];
+                    panelM->slots[uiDragIndex]  = ti;
+                    panelM->counts[uiDragIndex] = tc;
+                } else if (hoverPlayer >= 0 || hoverMachine < 0) {
+                    // Out of the machine and into your pockets.
+                    PlayerGiveItem(&player, panelM->slots[uiDragIndex],
+                                            panelM->counts[uiDragIndex]);
+                    panelM->slots[uiDragIndex] = ITEM_NONE;
+                    panelM->counts[uiDragIndex] = 0;
+                }
+            }
+            UiDragClear();
             player.inventoryDragging = false;
             player.inventoryDragIndex = -1;
         }
-        return;  // inventory open → the world is paused; skip everything below
     }
 
     // ── Craft menu ───────────────────────────────────────────
     if (player.craftMenuOpen) {
-        // Menu open: navigation only; the world is paused.
         CraftLayout craftLayout = { 0 };
-        UiGetCraftLayout(&craftLayout);
+        UiGetCraftLayout(&player, &craftLayout);
         int n = CraftableCount();
         int cols = craftLayout.cols;
         int gridRows = (n + cols - 1) / cols;    // total grid rows
@@ -599,14 +817,14 @@ static void UpdateGame(float dt) {
             if (wheel > 0) player.craftScroll--;
             if (wheel < 0) player.craftScroll++;
 
-            // 2D navigation: A/D (or arrows) step sideways, W/S hop
-            // a whole row. Clamped, not wrapped — a grid that wraps
-            // in both axes is a maze.
+            // 2D navigation with the ARROW keys only — WASD stays
+            // yours for walking while the menu is open. Clamped,
+            // not wrapped: a grid that wraps in both axes is a maze.
             int move = 0;
-            if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D)) move = 1;
-            if (IsKeyPressed(KEY_LEFT)  || IsKeyPressed(KEY_A)) move = -1;
-            if (IsKeyPressed(KEY_DOWN)  || IsKeyPressed(KEY_S)) move = cols;
-            if (IsKeyPressed(KEY_UP)    || IsKeyPressed(KEY_W)) move = -cols;
+            if (IsKeyPressed(KEY_RIGHT)) move = 1;
+            if (IsKeyPressed(KEY_LEFT))  move = -1;
+            if (IsKeyPressed(KEY_DOWN))  move = cols;
+            if (IsKeyPressed(KEY_UP))    move = -cols;
             if (move != 0) {
                 int next = player.craftSel + move;
                 if (next >= 0 && next < n) player.craftSel = next;
@@ -626,10 +844,12 @@ static void UpdateGame(float dt) {
         }
         if (IsKeyPressed(KEY_ENTER)) PlayerCraft(&player, CraftableAtRow(player.craftSel));
 
-        // Mouse: hover (when actually moving) selects a cell, click
-        // crafts it. Cell rects come from ui.h (UiCraftCellRect) —
-        // the same function the drawing uses, so click targets always
-        // match pixels.
+
+        
+        // Mouse: hover (when actually moving) selects a cell; left
+        // click crafts ONE, right click crafts a batch of FIVE.
+        // Cell rects come from ui.h (UiCraftCellRect) — the same
+        // function the drawing uses, so click targets match pixels.
         Vector2 mouseDelta = GetMouseDelta();
         bool mouseMoved = (mouseDelta.x != 0.0f || mouseDelta.y != 0.0f);
         for (int r = 0; r < visibleRows; r++) {
@@ -640,9 +860,13 @@ static void UpdateGame(float dt) {
                 UiButtonUpdate(&cellButton);
                 if (cellButton.hovered && mouseMoved) player.craftSel = idx;
                 if (cellButton.clicked) PlayerCraft(&player, CraftableAtRow(idx));
+                if (cellButton.hovered && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+                    for (int batch = 0; batch < 5; batch++) {
+                        if (!PlayerCraft(&player, CraftableAtRow(idx))) break;
+                    }
+                }
             }
         }
-        return;  // craft menu open → world paused
     }
 
     // ── Tech tree (RMB a Research Computer to open) ──────────
@@ -651,14 +875,31 @@ static void UpdateGame(float dt) {
         UiGetTechLayout(&techLayout);
         int total = TECH_COUNT - 1;
 
+        // Dismissal: the header [X], or EITHER mouse button clicked
+        // anywhere outside the panel. (E and TAB also close it and
+        // open their own menu — see PlayerToggleInventory/CraftMenu.)
+        Rectangle techPanel = { (float)techLayout.x, (float)techLayout.y,
+                                (float)techLayout.w, (float)techLayout.h };
+        bool clickedAny = IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
+                          IsMouseButtonPressed(MOUSE_BUTTON_RIGHT);
+        if (clickedAny) {
+            Vector2 mp = GetMousePosition();
+            bool onClose = CheckCollisionPointRec(mp,
+                UiPanelCloseRect(techLayout.x, techLayout.y, techLayout.w));
+            if (onClose || !CheckCollisionPointRec(mp, techPanel)) {
+                player.techMenuOpen = false;
+                return;   // that click was "close", not "research"
+            }
+        }
+
         // Same navigation scheme as the craft menu: wheel scrolls
         // the window, W/S move the selection, hover follows the
         // mouse only when it moves.
         float wheel = GetMouseWheelMove();
         if (wheel > 0) player.techScroll--;
         if (wheel < 0) player.techScroll++;
-        bool moveDown = IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S);
-        bool moveUp   = IsKeyPressed(KEY_UP)   || IsKeyPressed(KEY_W);
+        bool moveDown = IsKeyPressed(KEY_DOWN);   // arrows only — WASD walks
+        bool moveUp   = IsKeyPressed(KEY_UP);
         if (moveDown) player.techSel = (player.techSel + 1) % total;
         if (moveUp)   player.techSel = (player.techSel + total - 1) % total;
         if (moveDown || moveUp) {
@@ -683,53 +924,155 @@ static void UpdateGame(float dt) {
             if (techButton.hovered && mouseMoved) player.techSel = rIdx;
             if (techButton.clicked) PlayerResearch(&player, (TechID)(rIdx + 1));
         }
-        return;  // tech menu open → world paused
     }
 
-    // ── No menus open: normal gameplay input ─────────────────
-
-    // R rotates the placement direction for conveyors/inserters.
-    if (IsKeyPressed(KEY_R)) player.placeDir = (player.placeDir + 1) & 3;
-
-    // Clicking the on-screen hotbar selects that slot. The hit-test
-    // (UiHotbarSlotAt) shares its layout math with UiDrawHotbar, so
-    // the clickable area always matches the drawn pixels. The same
-    // helper stops the click reaching the world — see the guard at
-    // the top of UpdateMiningAndPlacing.
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        int clickedSlot = UiHotbarSlotAt(&player, GetMousePosition());
-        if (clickedSlot >= 0) PlayerSelectSlot(&player, clickedSlot);
-    }
-
-    // Mouse wheel: Ctrl+wheel zooms the camera, plain wheel cycles
-    // the hotbar (wheel up = previous slot, down = next). Kept as a
-    // float: trackpads report fractional scrolls that an int would
-    // truncate to 0, making the wheel appear dead.
-    float wheel = GetMouseWheelMove();
-    if (wheel != 0.0f) {
-        if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
-            camera.zoom += wheel * 0.1f;
-            if (camera.zoom < 0.6f) camera.zoom = 0.6f;   // clamp: not too far out
-            if (camera.zoom > 2.0f) camera.zoom = 2.0f;   // ...or in
-        } else {
-            if (wheel > 0) PlayerSelectRelative(&player, -1);
-            if (wheel < 0) PlayerSelectRelative(&player, 1);
+    // Craft-queue [x] buttons: cancel and refund that entry. Checked
+    // before world clicks so the button always wins.
+    if (player.craftQueueCount > 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        int shown = player.craftQueueCount < UI_QUEUE_MAX_SHOWN
+                  ? player.craftQueueCount : UI_QUEUE_MAX_SHOWN;
+        for (int i = 0; i < shown; i++) {
+            if (CheckCollisionPointRec(GetMousePosition(), UiCraftQueueCancelRect(i))) {
+                PlayerCancelCraftAt(&player, i);
+                return;
+            }
         }
     }
 
-    // Quick save/load hotkeys. (Escape → pause is handled at the
-    // top of this function, so it can also close menus.)
-    if (IsKeyPressed(KEY_F5)) GameSave();
-    if (IsKeyPressed(KEY_F9)) GameLoad();
+    // Walk away and the block's panel shuts itself — you can't
+    // manage a chest from across the base.
+    if (machineUiX >= 0 && machineUiY >= 0) {
+        Vector2 machinePos = { (machineUiX + 0.5f) * TILE_SIZE,
+                               (machineUiY + 0.5f) * TILE_SIZE };
+        if (Vector2Distance(player.pos, machinePos) > 7.0f * TILE_SIZE) {
+            machineUiX = machineUiY = -1;
+        }
+    }
 
-    // Finally, advance the simulation for this frame.
-    if (smgCooldown > 0) smgCooldown -= dt;
-    PlayerMove(&player, dt);
+    // ── Machine panel (chest / drill / inserter / belt) ───────
+    // Click a slot to move a stack: full slot + empty hand takes it
+    // out, held item + slot puts it in. Clicking the coal slot with
+    // coal in hand tops the hopper right up.
+    if (machineUiX >= 0 && machineUiY >= 0) {
+        Machine *m = MachineAt(machineUiX, machineUiY);
+        // Right-click closes the panel again (the same button that
+        // opened it), since world interaction is suppressed while
+        // it's up. Escape works too.
+        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            machineUiX = machineUiY = -1;
+            m = NULL;
+        }
+        if (m == NULL) {
+            machineUiX = machineUiY = -1;
+        } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            MachinePanelLayout ml = { 0 };
+            UiGetMachinePanelLayout(&player, m, &ml);
+            Vector2 mp = GetMousePosition();
+            ItemID held = player.selected;
+
+            // The header [X] closes the panel.
+            if (CheckCollisionPointRec(mp, UiPanelCloseRect(ml.x, ml.y, ml.w))) {
+                machineUiX = machineUiY = -1;
+                m = NULL;
+            }
+            // (Slot-to-slot moves belong to the shared drag system
+            // above; this block only owns the coal slot.)
+            if (m != NULL && ml.hasFuel && CheckCollisionPointRec(mp, ml.fuelRect)) {
+                if (held == ITEM_COAL) {
+                    while (player.inventory[ITEM_COAL] > 0 && MachineAddCoal(m)) {
+                        PlayerRemoveItem(&player, ITEM_COAL, 1);
+                    }
+                } else if (m->coal > 0) {
+                    PlayerGiveItem(&player, ITEM_COAL, m->coal);
+                    m->coal = 0;
+                }
+            }
+        }
+    }
+
+    // ── Gameplay input (only when no menu wants the mouse) ───
+    // Menus take the MOUSE, never the keyboard: they navigate with
+    // the arrow keys, leaving WASD free so you can keep walking
+    // while you craft or shuffle your backpack.
+    bool anyMenu = player.inventoryOpen || player.craftMenuOpen ||
+                   player.techMenuOpen || debugMenuOpen || machineUiX >= 0;
+
+    if (!anyMenu) {
+        // R means three things, resolved by what's under your hand:
+        // holding a gun → RELOAD; hovering a placed belt/arm →
+        // rotate it in place; otherwise → spin the build ghost.
+        if (IsKeyPressed(KEY_R)) {
+            Vector2 mw = GetScreenToWorld2D(GetMousePosition(), camera);
+            int htx = (int)(mw.x / TILE_SIZE), hty = (int)(mw.y / TILE_SIZE);
+            Machine *hovered = NULL;
+            if (htx >= 0 && htx < WORLD_SIZE && hty >= 0 && hty < WORLD_SIZE &&
+                TileIsDirectional(world[htx][hty].type)) {
+                hovered = MachineAt(htx, hty);
+            }
+            if (ItemIsWeapon(player.selected)) {
+                PlayerStartReload(&player, player.selected);
+            } else if (hovered != NULL) {
+                hovered->dir = (hovered->dir + 1) & 3;
+            } else {
+                player.placeDir = (player.placeDir + 1) & 3;
+            }
+        }
+
+        // Clicking the on-screen hotbar selects that slot. The
+        // hit-test (UiHotbarSlotAt) shares its layout math with
+        // UiDrawHotbar, so click targets always match pixels.
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            int clickedSlot = UiHotbarSlotAt(&player, GetMousePosition());
+            if (clickedSlot >= 0) PlayerSelectSlot(&player, clickedSlot);
+        }
+
+        // Mouse wheel: Ctrl+wheel zooms the camera, plain wheel
+        // cycles the hotbar. Kept as a float: trackpads report
+        // fractional scrolls that an int would truncate to 0.
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
+                camera.zoom += wheel * 0.1f;
+                if (camera.zoom < 0.6f) camera.zoom = 0.6f;   // clamp: not too far out
+                if (camera.zoom > 2.0f) camera.zoom = 2.0f;   // ...or in
+            } else {
+                if (wheel > 0) PlayerSelectRelative(&player, -1);
+                if (wheel < 0) PlayerSelectRelative(&player, 1);
+            }
+        }
+
+        // Quick save/load hotkeys.
+        if (IsKeyPressed(KEY_F5)) GameSave();
+        if (IsKeyPressed(KEY_F9)) GameLoad();
+
+        // Holding G shows the world map — mouse clicks belong to
+        // the map then, not to mining/shooting under the overlay.
+        if (!IsKeyDown(KEY_G)) UpdateMiningAndPlacing(dt);
+    }
+
+    // ── The simulation ALWAYS runs — menus don't pause the world.
+    if (weaponCooldown > 0) weaponCooldown -= dt;
+    PlayerMove(&player, dt);   // walk even with menus open
+
+    // Belts drag whatever stands on them, you included. Applied
+    // after PlayerMove and re-checked for walkability so a belt
+    // can never shove you inside a wall.
+    Vector2 carry = BeltCarry(player.pos, dt);
+    if (carry.x != 0.0f || carry.y != 0.0f) {
+        Vector2 rideX = { player.pos.x + carry.x, player.pos.y };
+        Vector2 rideY = { player.pos.x, player.pos.y + carry.y };
+        if (WorldPositionWalkable(rideX)) player.pos.x = rideX.x;
+        if (WorldPositionWalkable(rideY)) player.pos.y = rideY.y;
+    }
+
+    // Hold F to scoop cargo off nearby belts.
+    if (IsKeyDown(KEY_F)) BeltPickupNear(&player, TUNE.playerReach);
+
     PlayerUpdateVitals(&player, dt);
+    PlayerUpdateReload(&player, dt);
+    PlayerUpdateCrafting(&player, dt);
+    PlayerUpdateToasts(dt);
     WorldRevealAround(player.pos, FOW_REVEAL_TILES);   // push back the fog
-    // Holding G shows the world map — mouse clicks belong to the map
-    // then, not to mining/shooting under the overlay.
-    if (!IsKeyDown(KEY_G)) UpdateMiningAndPlacing(dt);
     EntitiesUpdate(dt, &player);   // mobs, machines, bots, bullets, bombs
 
     // Camera keeps the player centered even when the window resizes.
@@ -751,8 +1094,11 @@ static void UpdateGame(float dt) {
 // one of the most useful habits in game code.
 static void DrawGame(void) {
     BeginMode2D(camera);     // everything until EndMode2D is WORLD space
+        // Sun position for this frame — shadows swing as play time
+        // passes (entGameTime pauses with the game, so does the sun).
+        WorldSetClock(entGameTime);
         // Both world and entity layers cull to the visible slice —
-        // the map is 65k tiles, the screen shows a few hundred.
+        // the map is 147k tiles, the screen shows a few hundred.
         Vector2 viewTL = GetScreenToWorld2D((Vector2){ 0, 0 }, camera);
         Vector2 viewBR = GetScreenToWorld2D((Vector2){ (float)GetScreenWidth(),
                                                        (float)GetScreenHeight() }, camera);
@@ -763,6 +1109,8 @@ static void DrawGame(void) {
         // we convert the mouse to world space here because player.h
         // doesn't know the camera exists.
         PlayerDrawHeldItem(&player, GetScreenToWorld2D(GetMousePosition(), camera));
+        DrawPlacementGhost();   // preview of what RMB will build
+        PlayerDrawToasts(player.pos);   // "+12 Stone" floating up
     EndMode2D();
 
     // Getting hit flashes a red vignette (screen space from here on).
@@ -771,14 +1119,20 @@ static void DrawGame(void) {
         DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), (Color){ 200, 20, 20, a });
     }
 
-    UiDrawHelp();
     UiDrawHealth(&player);
+    UiDrawCraftQueue(&player);      // what's building right now
+    UiDrawAmmo(&player);            // ammo count / circular reload gauge
     UiDrawHotbar(&player);
     EntitiesDrawMinimap(&player);   // top-right map + threat readout
     if (IsKeyDown(KEY_G)) EntitiesDrawFullMap(&player);   // the big picture
+
+    // No dimming: the world stays fully lit and readable behind the
+    // panels, because it's still running and you're still in it.
     UiDrawInventory(&player);   // these draw nothing if their menu is closed
     UiDrawCraftMenu(&player);
+    UiDrawMachinePanel(&player);   // chest / drill / inserter / belt
     UiDrawTechMenu(&player);
+    UiDrawDragGhost();          // the stack riding the cursor
     DebugMenuDraw(&player);     // F3 console — always on top of the rest
 }
 
@@ -843,7 +1197,7 @@ static void DrawPause(void) {
     // MeasureText tells us how wide the string renders, so
     // cx - width/2 centers it horizontally.
     DrawText("PAUSED",
-             cx - MeasureText("PAUSED", 48) / 2, cy - 120, 48, WHITE);
+             cx - MeasureText("PAUSED", 48) / 2, cy - 250, 48, WHITE);
 
     LayoutPauseButtons();
     UiDrawButton(&pauseResumeButton);
