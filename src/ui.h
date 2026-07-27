@@ -348,17 +348,19 @@ static void UiDrawInventory(const Player *p) {
 
     for (int idx = 0; idx < INVENTORY_SIZE; idx++) {
         Rectangle rect = UiInventorySlotRect(&layout, idx);
-        bool hovered  = (idx == p->inventoryCursor);
-        bool dragging = p->inventoryDragging && idx == p->inventoryDragIndex;
+        // Hover is read from the MOUSE, the same way the machine
+        // panel does it — so the orange highlight behaves identically
+        // whichever panel the cursor is over.
+        bool hovered  = CheckCollisionPointRec(GetMousePosition(), rect);
+        bool dragging = (uiDragKind == DRAG_PLAYER && idx == uiDragIndex);
         bool isHotbar = idx < HOTBAR_MAX_SLOTS;
 
         DrawRectangleRec(rect, dragging ? (Color){ 96, 70, 24, 255 }
                              : (hovered ? UI_SLOT_HOVER : UI_SLOT_BG));
-        // The equipped hotbar slot glows Factorio-orange, even here.
         Color border = UI_SLOT_BORDER;
-        if (isHotbar && idx == p->selectedSlot) border = UI_ACCENT;
-        if (dragging || (hovered && p->inventoryDragging)) border = GOLD;
-        DrawRectangleLinesEx(rect, (border.r == UI_ACCENT.r && isHotbar) ? 2 : 1, border);
+        if (isHotbar && idx == p->selectedSlot) border = UI_ACCENT;  // equipped
+        if (hovered || dragging) border = UI_ACCENT;                 // drop target
+        DrawRectangleLinesEx(rect, (hovered || dragging) ? 2 : 1, border);
 
         if (p->inventorySlots[idx] != ITEM_NONE && p->inventoryAmounts[idx] > 0) {
             ItemID id = p->inventorySlots[idx];
@@ -633,8 +635,11 @@ static void UiDrawMachinePanel(const Player *p) {
     for (int i = 0; i < l.slotCount && i < l.cols * l.rows; i++) {
         Rectangle r = UiMachineSlotRect(&l, i);
         bool hovered = CheckCollisionPointRec(GetMousePosition(), r);
-        DrawRectangleRec(r, hovered ? UI_SLOT_HOVER : UI_SLOT_BG);
-        DrawRectangleLinesEx(r, 1, UI_SLOT_BORDER);
+        bool dragging = (uiDragKind == DRAG_MACHINE && i == uiDragIndex);
+        DrawRectangleRec(r, dragging ? (Color){ 96, 70, 24, 255 }
+                            : (hovered ? UI_SLOT_HOVER : UI_SLOT_BG));
+        DrawRectangleLinesEx(r, (hovered || dragging) ? 2 : 1,
+                             (hovered || dragging) ? UI_ACCENT : UI_SLOT_BORDER);
         if (m->slots[i] != ITEM_NONE && m->counts[i] > 0) {
             int icon = l.slotSize * 3 / 4;
             DrawItemSprite(m->slots[i], r.x + (l.slotSize - icon) / 2.0f,

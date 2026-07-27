@@ -364,6 +364,40 @@ static void NewGame(void) {
     EntitiesRegisterWorldMachines();   // give every spawner its brain
 }
 
+// ─── One slot, anywhere ──────────────────────────────────────
+// A SlotRef points at a stack wherever it lives — the backpack, the
+// hotbar, a chest, a drill. Transfers are written ONCE against this
+// abstraction, so every panel-to-panel move behaves identically
+// instead of each pairing growing its own special case.
+typedef struct { ItemID *id; int *count; } SlotRef;
+
+static SlotRef PlayerSlotRef(Player *p, int i) {
+    return (SlotRef){ &p->inventorySlots[i], &p->inventoryAmounts[i] };
+}
+static SlotRef MachineSlotRef(Machine *m, int i) {
+    return (SlotRef){ &m->slots[i], &m->counts[i] };
+}
+
+// Move `from` onto `to`. Same item → merge up to STACK_MAX;
+// anything else (including an empty target) → swap. Dropping on a
+// specific slot therefore lands in THAT slot, never "the first free
+// one somewhere else".
+static void SlotTransfer(SlotRef from, SlotRef to) {
+    if (*from.id == ITEM_NONE || *from.count <= 0) return;
+    if (*to.id == *from.id && *to.count > 0) {
+        int room = STACK_MAX - *to.count;
+        if (room <= 0) return;                     // target stack is full
+        int move = (*from.count < room) ? *from.count : room;
+        *to.count   += move;
+        *from.count -= move;
+        if (*from.count <= 0) { *from.id = ITEM_NONE; *from.count = 0; }
+    } else {
+        ItemID ti = *to.id;  int tc = *to.count;
+        *to.id   = *from.id; *to.count   = *from.count;
+        *from.id = ti;       *from.count = tc;
+    }
+}
+
 // ─── Mouse actions in the world: mine, place, shoot ──────────
 static void UpdateMiningAndPlacing(float dt) {
     // Mouse over the hotbar? That click belongs to the UI — don't
@@ -755,42 +789,29 @@ static void UpdateGame(float dt) {
             }
         }
 
-        // RELEASE — resolve the drop.
+        // RELEASE — resolve the drop. Every combination goes through
+        // the same SlotTransfer, so backpack→chest, chest→hotbar and
+        // chest→chest all behave the same way and land exactly where
+        // you aimed.
         if (uiDragKind != DRAG_NONE && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            if (uiDragKind == DRAG_PLAYER) {
-                if (hoverPlayer >= 0 && hoverPlayer != uiDragIndex) {
-                    PlayerInventorySwapSlots(&player, uiDragIndex, hoverPlayer);
-                } else if (hoverMachine >= 0 && panelM != NULL) {
-                    // Into the machine: only what actually fits moves.
-                    int put = MachineAddItem(panelM, uiDragItem,
-                                             player.inventoryAmounts[uiDragIndex]);
-                    if (put > 0) {
-                        player.inventoryAmounts[uiDragIndex] -= put;
-                        if (player.inventoryAmounts[uiDragIndex] <= 0) {
-                            player.inventorySlots[uiDragIndex] = ITEM_NONE;
-                            player.inventoryAmounts[uiDragIndex] = 0;
-                        }
-                        PlayerRecount(&player);
+            bool srcPlayer = (uiDragKind == DRAG_PLAYER);
+            bool haveSrc = srcPlayer ? (uiDragIndex >= 0 && uiDragIndex < INVENTORY_SIZE)
+                                     : (panelM != NULL && uiDragIndex >= 0);
+            if (haveSrc) {
+                SlotRef from = srcPlayer ? PlayerSlotRef(&player, uiDragIndex)
+                                         : MachineSlotRef(panelM, uiDragIndex);
+                if (hoverPlayer >= 0) {
+                    if (!(srcPlayer && hoverPlayer == uiDragIndex)) {
+                        SlotTransfer(from, PlayerSlotRef(&player, hoverPlayer));
+                    } else if (uiDragIndex < HOTBAR_MAX_SLOTS) {
+                        PlayerSelectSlot(&player, uiDragIndex);   // dropped where it started = equip
                     }
-                } else if (uiDragIndex >= 0 && uiDragIndex < HOTBAR_MAX_SLOTS &&
-                           hoverPlayer == uiDragIndex) {
-                    PlayerSelectSlot(&player, uiDragIndex);   // click = equip
+                } else if (hoverMachine >= 0 && panelM != NULL) {
+                    if (!(!srcPlayer && hoverMachine == uiDragIndex)) {
+                        SlotTransfer(from, MachineSlotRef(panelM, hoverMachine));
+                    }
                 }
-            } else if (uiDragKind == DRAG_MACHINE && panelM != NULL) {
-                if (hoverMachine >= 0 && hoverMachine != uiDragIndex) {
-                    ItemID ti = panelM->slots[hoverMachine];   // swap within the machine
-                    int    tc = panelM->counts[hoverMachine];
-                    panelM->slots[hoverMachine]  = panelM->slots[uiDragIndex];
-                    panelM->counts[hoverMachine] = panelM->counts[uiDragIndex];
-                    panelM->slots[uiDragIndex]  = ti;
-                    panelM->counts[uiDragIndex] = tc;
-                } else if (hoverPlayer >= 0 || hoverMachine < 0) {
-                    // Out of the machine and into your pockets.
-                    PlayerGiveItem(&player, panelM->slots[uiDragIndex],
-                                            panelM->counts[uiDragIndex]);
-                    panelM->slots[uiDragIndex] = ITEM_NONE;
-                    panelM->counts[uiDragIndex] = 0;
-                }
+                PlayerRecount(&player);   // totals are always derived
             }
             UiDragClear();
             player.inventoryDragging = false;

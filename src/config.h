@@ -53,7 +53,9 @@
 // ─── Player ─────────────────────────────────────────────────
 #define PLAYER_SPEED   330.0f      // pixels per second (~14 tiles/s)
 #define PLAYER_RADIUS  7.0f        // size of the player circle
-#define PLAYER_REACH   70.0f       // max distance (px) you can mine/place
+#define PLAYER_REACH   130.0f      // max distance (px) you can mine/place
+                                   // (~5.5 tiles — comfortable for laying
+                                   // belt runs without walking every step)
 #define SLINGSHOT_REACH 280.0f      // slingshot shoots FAR now
 #define PISTOL_REACH        320.0f      // gun range in pixels
 #define SLINGSHOT_SPEED     800.0f      // projectile speed
