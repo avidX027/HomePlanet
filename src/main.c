@@ -47,7 +47,7 @@
 // C CONCEPT — enum: a set of named integer constants. Under the
 // hood SCREEN_TITLE is 0, SCREEN_GAME is 1, and so on. `typedef`
 // gives the type a short name so we can write `Screen` everywhere.
-typedef enum { SCREEN_TITLE, SCREEN_GAME, SCREEN_PAUSE, SCREEN_SETTINGS } Screen;
+typedef enum { SCREEN_TITLE, SCREEN_GAME, SCREEN_PAUSE, SCREEN_SETTINGS, SCREEN_GAME_SAVES } Screen;
 
 // This one variable is the whole "which screen am I on" state
 // machine. The main loop at the bottom switches behavior on it.
@@ -64,6 +64,7 @@ static Camera2D camera = { 0 };      // raylib camera that follows the player
 // zeroed anyway, but writing it makes the intent explicit.
 static UIButton titleStartButton    = { 0 };
 static UIButton titleContinueButton = { 0 };
+static UIButton gameSavesBackButton = { 0 };
 static UIButton titleQuitButton     = { 0 };
 static UIButton pauseSaveButton     = { 0 };
 static UIButton pauseLoadButton     = { 0 };
@@ -1259,7 +1260,7 @@ static void LayoutTitleButtons(void) {
     titleStartButton.rect    = (Rectangle){ cx - 110, cy + 90, 220, 56 };
     titleStartButton.text    = "NEW GAME";
     titleContinueButton.rect = (Rectangle){ cx - 110, cy + 20, 220, 56 };
-    titleContinueButton.text = "CONTINUE SAVE";
+    titleContinueButton.text = "CONTINUE";
     titleQuitButton.rect     = (Rectangle){ cx - 110, cy + 160, 220, 56 };
     titleQuitButton.text     = "QUIT";
 }
@@ -1293,7 +1294,7 @@ static void UpdateTitle(void) {
     // fall back to a new game rather than crashing or doing nothing.
     if (hasSave && UiButtonUpdate(&titleContinueButton)) {
         if (!GameLoad()) NewGame();
-        screen = SCREEN_GAME;
+        screen = SCREEN_GAME_SAVES;
         return;
     }
 
