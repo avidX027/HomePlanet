@@ -18,7 +18,7 @@
 #include "gamedata.h"
 #include "world.h"
 
-#define CRAFT_QUEUE_MAX 16   // how many builds can be waiting at once
+#define CRAFT_QUEUE_MAX 100   // how many builds can be waiting at once
 #define HOTBAR_MAX_SLOTS 7
 #define INVENTORY_COLS 7    // 7 wide — the top row IS the hotbar
 #define INVENTORY_ROWS 7

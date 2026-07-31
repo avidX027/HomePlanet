@@ -77,6 +77,7 @@ typedef enum {
     ITEM_RESEARCH_COMPUTER, // places TILE_RESEARCH
     ITEM_METAL_WALL,      // places TILE_METAL_WALL
     ITEM_DOOR,            // places TILE_DOOR
+    ITEM_GEM,
     ITEM_COUNT
 } ItemID;
 
@@ -177,6 +178,7 @@ static ItemInfo ITEMS[ITEM_COUNT] = {
     [ITEM_RESEARCH_COMPUTER] = { "Research Computer", (Color){ 70,160,220,255}, 0, TILE_RESEARCH, true, ITEM_WOOD, 8, ITEM_METAL, 4, 1 },
     [ITEM_METAL_WALL]   = { "Metal Wall",  (Color){155,155,175,255}, 0,  TILE_METAL_WALL, true, ITEM_METAL,      3, ITEM_NONE,    0, 2, TECH_DEFENSE },
     [ITEM_DOOR]         = { "Door",        (Color){150,100, 55,255}, 0,  TILE_DOOR,  true,      ITEM_WOOD,       4, ITEM_NONE,    0, 1 },
+    [ITEM_GEM]          = { "Gem",         (Color){3, 165, 252, 255}, 0, TILE_GRASS, false,    ITEM_NONE, 0, ITEM_NONE, 0, 1}
 };
 
 typedef struct {
@@ -196,23 +198,23 @@ static TileInfo TILES[TILE_COUNT] = {
     [TILE_GRASS]        = { "Grass",         (Color){ 40,150, 60,255},  1,   ITEM_NONE,                0, false, true  },
     [TILE_TREE]         = { "Tree",          (Color){ 90, 60, 30,255},  4,   ITEM_WOOD,               10, true,  false },
     [TILE_ROCK]         = { "Rock",          (Color){ 80, 80, 90,255},  8,   ITEM_STONE,              10, true,  false },
-    [TILE_SULFUR_NODE]  = { "Sulfur Node",   (Color){198,178, 44,255}, 14,   ITEM_SULFUR_ORE,          3, true,  false },
-    [TILE_METAL_NODE]   = { "Metal Node",    (Color){146,152,190,255}, 16,   ITEM_METAL_ORE,           3, true,  false },
-    [TILE_COAL_NODE]    = { "Coal Node",     (Color){ 52, 50, 56,255}, 12,   ITEM_COAL,                4, true,  false },
-    [TILE_WALL]         = { "Wall",          (Color){170,170,180,255}, 12,   ITEM_STONE,               1, true,  false },
+    [TILE_SULFUR_NODE]  = { "Sulfur Node",   (Color){198,178, 44,255}, 8,   ITEM_SULFUR_ORE,          3, true,  false },
+    [TILE_METAL_NODE]   = { "Metal Node",    (Color){146,152,190,255}, 9,   ITEM_METAL_ORE,           3, true,  false },
+    [TILE_COAL_NODE]    = { "Coal Node",     (Color){ 52, 50, 56,255}, 7,   ITEM_COAL,                4, true,  false },
+    [TILE_WALL]         = { "Wall",          (Color){170,170,180,255}, 28,   ITEM_STONE,               1, true,  false },
     [TILE_METAL_WALL]   = { "Metal Wall",    (Color){150,150,170,255}, 45,   ITEM_METAL,               1, true,  false },
-    [TILE_DOOR]         = { "Door",          (Color){150,100, 55,255}, 10,   ITEM_DOOR,                1, true,  false },
-    [TILE_CHEST]        = { "Chest",         (Color){120, 90, 45,255}, 12,   ITEM_CHEST,               1, true,  false },
+    [TILE_DOOR]         = { "Door",          (Color){150,100, 55,255}, 25,   ITEM_DOOR,                1, true,  false },
+    [TILE_CHEST]        = { "Chest",         (Color){120, 90, 45,255}, 16,   ITEM_CHEST,               1, true,  false },
     [TILE_DRILL]        = { "Mining Drill",  (Color){110, 95, 55,255}, 16,   ITEM_DRILL,               1, true,  false },
     // Belts are deliberately flimsy — a tap picks one back up, so
     // re-routing a line is fast instead of a chore.
     [TILE_CONVEYOR]     = { "Conveyor",      (Color){ 70, 70, 60,255},  1,   ITEM_CONVEYOR,            1, true,  true  },
     [TILE_CONVEYOR_CORNER] = { "Belt Corner",(Color){ 74, 68, 58,255},  1,   ITEM_CONVEYOR_CORNER,     1, true,  true  },
     [TILE_INSERTER]     = { "Inserter",      (Color){ 95, 75, 40,255},  6,   ITEM_INSERTER,            1, true,  false },
-    [TILE_TURRET]       = { "Gun Turret",    (Color){ 90, 90,100,255}, 22,   ITEM_TURRET,              1, true,  false },
-    [TILE_LASER_TURRET] = { "Laser Turret",  (Color){110, 70, 70,255}, 22,   ITEM_LASER_TURRET,        1, true,  false },
+    [TILE_TURRET]       = { "Gun Turret",    (Color){ 90, 90,100,255}, 18,   ITEM_TURRET,              1, true,  false },
+    [TILE_LASER_TURRET] = { "Laser Turret",  (Color){110, 70, 70,255}, 18,   ITEM_LASER_TURRET,        1, true,  false },
     [TILE_RESEARCH]     = { "Research Comp.",(Color){ 45, 75,110,255}, 16,   ITEM_RESEARCH_COMPUTER,   1, true,  false },
-    [TILE_SPAWNER]      = { "Mob Spawner",   (Color){ 90, 40,110,255}, 60,   ITEM_SULFUR,              5, true,  false },
+    [TILE_SPAWNER]      = { "Mob Spawner",   (Color){ 90, 40,110,255}, 40,   ITEM_GEM,              5, true,  false },
 };
 
 // ─── Tile break loot ──────────────────────────────────────
@@ -279,6 +281,15 @@ typedef struct {
 } ItemArt;
 
 static const ItemArt ITEM_ART[ITEM_COUNT] = {
+    [ITEM_GEM] = { { 0, 220, 255, 255 }, {    // brilliant gem / diamond
+        "..oooo..",
+        ".ollllbo.",
+        "olbbbbbbd",
+        "obllllbbd",
+        ".obbbbdd.",
+        "..obbdd..",
+        "...obd...",
+        "....o...." } },
     [ITEM_WOOD] = { { 95, 60, 35, 255 }, {      // stacked planks
         "oooooooo",
         "obblbbdo",

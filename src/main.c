@@ -64,6 +64,7 @@ static Camera2D camera = { 0 };      // raylib camera that follows the player
 // zeroed anyway, but writing it makes the intent explicit.
 static UIButton titleStartButton    = { 0 };
 static UIButton titleContinueButton = { 0 };
+static UIButton titleQuitButton     = { 0 };
 static UIButton pauseSaveButton     = { 0 };
 static UIButton pauseLoadButton     = { 0 };
 static UIButton pauseResumeButton   = { 0 };
@@ -1280,6 +1281,8 @@ static void LayoutTitleButtons(void) {
     titleStartButton.text    = "NEW GAME";
     titleContinueButton.rect = (Rectangle){ cx - 110, cy + 20, 220, 56 };
     titleContinueButton.text = "CONTINUE";
+    titleQuitButton.rect     = (Rectangle){ cx - 110, cy + 160, 220, 56 };
+    titleQuitButton.text     = "QUIT";
 }
 
 static void UpdateTitle(void) {
@@ -1298,6 +1301,11 @@ static void UpdateTitle(void) {
     // Escape on the title screen closes the whole program — but only
     // by raising the flag; the main loop sees it and exits cleanly.
     if (IsKeyPressed(KEY_ESCAPE)) {
+        quitRequested = true;
+        return;
+    }
+
+    if (UiButtonUpdate(&titleQuitButton)) {
         quitRequested = true;
         return;
     }
@@ -1330,6 +1338,7 @@ static void DrawTitle(void) {
 
     LayoutTitleButtons();
     UiDrawButton(&titleStartButton);
+    UiDrawButton(&titleQuitButton);
 
     // CONTINUE is drawn only when there's a save — matching the
     // click logic in UpdateTitle so you can't click an invisible button.
