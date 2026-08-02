@@ -71,7 +71,7 @@ static bool TileIsRockLike(TileType t) {
 static Tile world[WORLD_SIZE][WORLD_SIZE];
 
 // Fog of war: which tiles has the player ever SEEN? Drives the
-// minimap and the hold-G map; the live view is never fogged.
+// minimap and the hold-G map; the live view is never fogged.~
 static bool worldExplored[WORLD_SIZE][WORLD_SIZE];
 
 // The minimap needs re-rendering whenever a tile changes; drawing
