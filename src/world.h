@@ -20,6 +20,7 @@
 #include "raylib.h"
 #include "raymath.h"   // Vector2Distance — canopy fade near the player
 #include "config.h"
+#include "sound.h"     // tiles make noises when they break
 #include "gamedata.h"
 
 // ─── Biomes ───────────────────────────────────────────────
@@ -78,6 +79,41 @@ static bool worldExplored[WORLD_SIZE][WORLD_SIZE];
 // 147,456 rectangles every frame would not fly, so we keep a texture
 // and only rebuild it when this flag says the world changed.
 static bool worldMinimapDirty = true;
+
+// ─── How big is the map, really? ──────────────────────────
+// WORLD_SIZE is how much memory we RESERVE; `worldSize` is how much
+// of it is currently a world. Everything outside is TILE_VOID, which
+// nothing can enter or break. The dev console slides this and
+// regenerates, which is how you get a pocket-sized test map or the
+// full continent without recompiling.
+static int worldSize = WORLD_SIZE;
+
+static float WorldCenterPx(void) { return worldSize * TILE_SIZE / 2.0f; }
+static bool  WorldInBounds(int x, int y) {
+    return x >= 0 && x < worldSize && y >= 0 && y < worldSize;
+}
+
+// Where the player is standing, in world pixels. Sounds get quieter
+// with distance from it. main.c feeds this in every frame, the same
+// way it feeds the day-cycle clock — world.h can't see the player.
+static Vector2 worldListener = { 0, 0 };
+static void WorldSetListener(Vector2 at) { worldListener = at; }
+
+// ─── Break events ─────────────────────────────────────────
+// A tile can be destroyed by six different things (you, a drill, a
+// bot, a bullet, a mob's teeth, a bomb). Rather than teach all six
+// to spawn debris, WorldDamageTile records WHAT broke and WHERE, and
+// entities.h drains the list once a frame and makes the mess. One
+// place to add a new effect; every cause gets it for free.
+#define WORLD_BREAK_EVENTS 48
+typedef struct { int x, y; TileType type; } WorldBreakEvent;
+static WorldBreakEvent worldBreaks[WORLD_BREAK_EVENTS];
+static int worldBreakCount = 0;
+
+static void WorldPushBreak(int x, int y, TileType t) {
+    if (worldBreakCount >= WORLD_BREAK_EVENTS) return;   // a busy frame; fine
+    worldBreaks[worldBreakCount++] = (WorldBreakEvent){ x, y, t };
+}
 
 // Deterministic per-tile "randomness" for visual variety (speckles,
 // canopy sizes). Same x,y → same number, every frame, no storage.
@@ -160,11 +196,25 @@ static void WorldRevealAround(Vector2 posPx, int radiusTiles) {
 // infestation patches placed far from spawn, like biter bases.
 #define BIOME_SEEDS 40   // more seeds for the much bigger map
 static void WorldInit(void) {
+    // Everything outside the ACTIVE map is void first, so a smaller
+    // world is genuinely bounded rather than fading into old terrain.
+    if (worldSize < 32) worldSize = 32;
+    if (worldSize > WORLD_SIZE) worldSize = WORLD_SIZE;
+    for (int x = 0; x < WORLD_SIZE; x++) {
+        for (int y = 0; y < WORLD_SIZE; y++) {
+            world[x][y].type    = TILE_VOID;
+            world[x][y].health  = TILES[TILE_VOID].maxHealth;
+            world[x][y].biome   = BIOME_MEADOW;
+            world[x][y].variant = 0;
+            world[x][y].ore     = 0;
+        }
+    }
+
     int seedX[BIOME_SEEDS], seedY[BIOME_SEEDS];
     Biome seedB[BIOME_SEEDS];
     for (int i = 0; i < BIOME_SEEDS; i++) {
-        seedX[i] = GetRandomValue(0, WORLD_SIZE - 1);
-        seedY[i] = GetRandomValue(0, WORLD_SIZE - 1);
+        seedX[i] = GetRandomValue(0, worldSize - 1);
+        seedY[i] = GetRandomValue(0, worldSize - 1);
         int roll = GetRandomValue(1, 100);   // meadow half, rest split
         seedB[i] = (roll <= 50) ? BIOME_MEADOW : (roll <= 75) ? BIOME_FOREST : BIOME_ROCKLANDS;
     }
@@ -173,22 +223,22 @@ static void WorldInit(void) {
     // hugging the border. MATH — random angle + random distance in
     // [0.33, 0.46] of the world span puts them "out there" without
     // being predictable.
-    int center = WORLD_SIZE / 2;
+    int center = worldSize / 2;
     int patchX[INFESTATION_PATCHES], patchY[INFESTATION_PATCHES];
     for (int i = 0; i < INFESTATION_PATCHES; i++) {
         float angle = GetRandomValue(0, 6283) / 1000.0f;   // 0..2π
-        float dist  = WORLD_SIZE * (0.33f + GetRandomValue(0, 130) / 1000.0f);
+        float dist  = worldSize * (0.33f + GetRandomValue(0, 130) / 1000.0f);
         int px = center + (int)(cosf(angle) * dist);
         int py = center + (int)(sinf(angle) * dist);
         if (px < INFESTATION_RADIUS + 4) px = INFESTATION_RADIUS + 4;
         if (py < INFESTATION_RADIUS + 4) py = INFESTATION_RADIUS + 4;
-        if (px > WORLD_SIZE - INFESTATION_RADIUS - 4) px = WORLD_SIZE - INFESTATION_RADIUS - 4;
-        if (py > WORLD_SIZE - INFESTATION_RADIUS - 4) py = WORLD_SIZE - INFESTATION_RADIUS - 4;
+        if (px > worldSize - INFESTATION_RADIUS - 4) px = worldSize - INFESTATION_RADIUS - 4;
+        if (py > worldSize - INFESTATION_RADIUS - 4) py = worldSize - INFESTATION_RADIUS - 4;
         patchX[i] = px; patchY[i] = py;
     }
 
-    for (int x = 0; x < WORLD_SIZE; x++) {
-        for (int y = 0; y < WORLD_SIZE; y++) {
+    for (int x = 0; x < worldSize; x++) {
+        for (int y = 0; y < worldSize; y++) {
             // Nearest seed → biome (squared distance: no sqrt needed
             // when you only COMPARE distances).
             int best = 0;
@@ -261,8 +311,8 @@ static void WorldInit(void) {
         int pcx = 0, pcy = 0;
         // A few tries to land away from the spawn clearing.
         for (int attempt = 0; attempt < 8; attempt++) {
-            pcx = GetRandomValue(12, WORLD_SIZE - 13);
-            pcy = GetRandomValue(12, WORLD_SIZE - 13);
+            pcx = GetRandomValue(12, worldSize - 13);
+            pcy = GetRandomValue(12, worldSize - 13);
             long dx = pcx - center, dy = pcy - center;
             if (dx * dx + dy * dy > (long)(SPAWN_CLEAR_RADIUS + 14) * (SPAWN_CLEAR_RADIUS + 14)) break;
         }
@@ -270,7 +320,7 @@ static void WorldInit(void) {
 
         for (int x = pcx - radius; x <= pcx + radius; x++) {
             for (int y = pcy - radius; y <= pcy + radius; y++) {
-                if (x < 1 || x >= WORLD_SIZE - 1 || y < 1 || y >= WORLD_SIZE - 1) continue;
+                if (x < 1 || x >= worldSize - 1 || y < 1 || y >= worldSize - 1) continue;
                 long dx = x - pcx, dy = y - pcy;
                 long r = radius - (long)(WorldHash(x, y) % 3);   // chewed edge
                 if (dx * dx + dy * dy > r * r) continue;
@@ -290,13 +340,38 @@ static void WorldInit(void) {
         }
     }
 
+    // ── Quicksand ─────────────────────────────────────────
+    // Soft blobby pools, mostly out in the open ground where you'd
+    // be running carelessly. They look like pale sand and they are
+    // NOT solid — you walk in, and then you find out.
+    for (int i = 0; i < QUICKSAND_PATCHES; i++) {
+        int qcx = GetRandomValue(8, worldSize - 9);
+        int qcy = GetRandomValue(8, worldSize - 9);
+        long dcx = qcx - center, dcy = qcy - center;
+        // Never right on top of spawn; the first ten seconds of the
+        // game shouldn't be a trap.
+        if (dcx * dcx + dcy * dcy < (long)(SPAWN_CLEAR_RADIUS + 10) * (SPAWN_CLEAR_RADIUS + 10)) continue;
+        int radius = GetRandomValue(2, 5);
+        for (int x = qcx - radius; x <= qcx + radius; x++) {
+            for (int y = qcy - radius; y <= qcy + radius; y++) {
+                if (x < 1 || x >= worldSize - 1 || y < 1 || y >= worldSize - 1) continue;
+                long dx = x - qcx, dy = y - qcy;
+                long r = radius - (long)(WorldHash(x, y) % 2);
+                if (dx * dx + dy * dy > r * r) continue;
+                if (world[x][y].type != TILE_GRASS) continue;   // only open ground
+                world[x][y].type   = TILE_QUICKSAND;
+                world[x][y].health = TILES[TILE_QUICKSAND].maxHealth;
+            }
+        }
+    }
+
     // Spawner nests cluster INSIDE each infestation patch.
     for (int i = 0; i < INFESTATION_PATCHES; i++) {
         int nests = GetRandomValue(4, 7);
         for (int n = 0; n < nests; n++) {
             int sx = patchX[i] + GetRandomValue(-INFESTATION_RADIUS + 4, INFESTATION_RADIUS - 4);
             int sy = patchY[i] + GetRandomValue(-INFESTATION_RADIUS + 4, INFESTATION_RADIUS - 4);
-            if (sx < 1 || sx >= WORLD_SIZE - 1 || sy < 1 || sy >= WORLD_SIZE - 1) continue;
+            if (sx < 1 || sx >= worldSize - 1 || sy < 1 || sy >= worldSize - 1) continue;
             world[sx][sy].type   = TILE_SPAWNER;
             world[sx][sy].health = TILES[TILE_SPAWNER].maxHealth;
             world[sx][sy].variant = 0;
@@ -307,6 +382,8 @@ static void WorldInit(void) {
     memset(worldExplored, 0, sizeof(worldExplored));
     WorldRevealAround((Vector2){ center * (float)TILE_SIZE, center * (float)TILE_SIZE },
                       FOW_REVEAL_TILES + 6);
+    worldBreakCount = 0;
+    worldHealCursor = 0;
     worldMinimapDirty = true;
 }
 
@@ -393,18 +470,89 @@ static void WorldSetTile(int x, int y, TileType t) {
     worldMinimapDirty   = true;
 }
 
+// ─── Crumbling ────────────────────────────────────────────
+// A rock's SHAPE is derived from its health, not stored separately:
+// chip a boulder down and it steps from full → three-quarter → half
+// → a pebble you can walk over. The thresholds line up with the
+// sizes worldgen hands out, so a rock that generated as a half rock
+// reads as a half rock without being damaged at all.
+//
+// The lovely part is that this feeds straight into WorldSolidRects,
+// so a rock you've mined halfway through is ALSO physically smaller:
+// the gap opens up before the rock is gone.
+static void WorldUpdateRockShape(int x, int y) {
+    TileType t = world[x][y].type;
+    if (!TileIsRockLike(t)) return;
+    float full = TILES[t].maxHealth;
+    if (full <= 0) return;
+    float frac = world[x][y].health / full;
+    int size = (frac > 0.85f) ? 0 : (frac > 0.65f) ? 1 : (frac > 0.45f) ? 2 : 3;
+    int corner = (world[x][y].variant >> 2) & 3;
+    int wasSize = world[x][y].variant & 3;
+    unsigned char next = (unsigned char)(size | (corner << 2));
+    if (next == world[x][y].variant) return;
+    world[x][y].variant = next;
+    // Only the way DOWN makes a noise: a boulder losing a chunk is an
+    // event, a boulder slowly healing overnight is not.
+    if (size > wasSize) {
+        SfxPlayAt(SFX_ROCK_BREAK, (Vector2){ (x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE },
+                  worldListener, 0.22f);
+    }
+}
+
 // ─── Damage a tile; returns true if it broke this call ────
 // (Caller decides what to do with the drops — world.h doesn't
 // know inventories exist.)
 static bool WorldDamageTile(int x, int y, float damage) {
-    if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_SIZE) return false;
-    if (!TILES[world[x][y].type].breakable) return false;
+    if (!WorldInBounds(x, y)) return false;
+    TileType t = world[x][y].type;
+    if (!TILES[t].breakable) return false;
     world[x][y].health -= damage;
     if (world[x][y].health <= 0) {
         WorldSetTile(x, y, TILE_GRASS);   // broken tiles become grass
+        WorldPushBreak(x, y, t);          // ...and entities.h makes the mess
+        Vector2 at = { (x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE };
+        SfxPlayAt(t == TILE_TREE ? SFX_TREE_BREAK : SFX_ROCK_BREAK, at, worldListener, 0.55f);
         return true;
     }
+    WorldUpdateRockShape(x, y);           // not dead yet, but visibly chewed
     return false;
+}
+
+// ─── Blocks knit themselves back together ─────────────────
+// Anything scratched but not destroyed repairs itself, slowly. A
+// wall the mobs chewed at last night is whole again by morning; a
+// rock you gave up on grows back. The rate is far under any weapon's
+// DPS, so it never rescues you mid-fight — it just means the world
+// isn't a permanent record of every scuff.
+//
+// PERFORMANCE — the map is half a million tiles, so we sweep a slice
+// per frame with a rolling cursor instead of touching all of it. The
+// heal amount is per SWEEP, not per second, which keeps the pace the
+// same however fast the machine runs.
+static int worldHealCursor = 0;
+static void WorldHealTick(void) {
+    int tiles = TILE_HEAL_TILES_PER_FRAME;
+    int total = worldSize * worldSize;
+    if (total <= 0) return;
+    if (tiles > total) tiles = total;
+    for (int i = 0; i < tiles; i++) {
+        if (worldHealCursor >= total) worldHealCursor = 0;
+        int x = worldHealCursor % worldSize;
+        int y = worldHealCursor / worldSize;
+        worldHealCursor++;
+
+        TileType t = world[x][y].type;
+        if (!TILES[t].breakable) continue;
+        float full = TILES[t].maxHealth;
+        if (world[x][y].health >= full) continue;
+        world[x][y].health += TUNE.tileHealRate;
+        if (world[x][y].health > full) world[x][y].health = full;
+        WorldUpdateRockShape(x, y);       // healed rocks grow back too
+        // (Deliberately NOT dirtying the minimap: healing touches
+        // thousands of tiles a second and the map only shows tile
+        // TYPES, which healing never changes.)
+    }
 }
 
 // ─── Irregular blobs (rocks, tree canopies) ───────────────
@@ -524,7 +672,8 @@ static void WorldDraw(Vector2 viewTopLeft, Vector2 viewBottomRight, Vector2 focu
     for (int x = x0; x <= x1; x++) {
         for (int y = y0; y <= y1; y++) {
             TileType t = world[x][y].type;
-            if (t == TILE_GRASS) continue;
+            // Flat things cast nothing: grass, a sand pool, the void.
+            if (t == TILE_GRASS || t == TILE_QUICKSAND || t == TILE_VOID) continue;
             float px = x * ts, py = y * ts;
             float sx = worldShadowVec.x, sy = worldShadowVec.y;
 
@@ -651,6 +800,27 @@ static void WorldDraw(Vector2 viewTopLeft, Vector2 viewBottomRight, Vector2 focu
                 DrawRectangle((int)px, (int)py, (int)ts, (int)ts, wallC);
                 DrawRectangle((int)px, (int)py, (int)ts, 3, ItemArtShade(wallC, 1.22f));
                 DrawRectangle((int)px, (int)(py + ts - 3), (int)ts, 3, ItemArtShade(wallC, 0.6f));
+            } else if (t == TILE_QUICKSAND) {
+                // Pale sand with slow concentric ripples. It reads as
+                // "ground, but wrong" — which is the whole trick.
+                DrawRectangle((int)px, (int)py, (int)ts + 1, (int)ts + 1, info->color);
+                float wob = sinf((float)GetTime() * 1.3f + (h % 100) * 0.06f);
+                Color ring = ItemArtShade(info->color, 0.82f);
+                DrawEllipseLines((int)(px + ts / 2), (int)(py + ts / 2),
+                                 ts * (0.34f + 0.05f * wob), ts * (0.26f + 0.04f * wob), ring);
+                DrawEllipseLines((int)(px + ts / 2), (int)(py + ts / 2),
+                                 ts * (0.18f - 0.04f * wob), ts * (0.13f - 0.03f * wob), ring);
+                DrawRectangle((int)(px + (h % 17)), (int)(py + ((h >> 6) % 17)), 2, 2,
+                              ItemArtShade(info->color, 1.2f));
+            } else if (t == TILE_VOID) {
+                // The edge of the world: empty space with a few cold
+                // stars, so a shrunk map has an honest border instead
+                // of a wall of nothing.
+                DrawRectangle((int)px, (int)py, (int)ts + 1, (int)ts + 1, info->color);
+                if ((h % 11) == 0) {
+                    DrawRectangle((int)(px + (h % 19)), (int)(py + ((h >> 8) % 19)), 2, 2,
+                                  (Color){ 200, 210, 240, (unsigned char)(90 + h % 120) });
+                }
             } else if (t == TILE_SPAWNER) {
                 // Organic nest mound (entities.h adds the pulse).
                 DrawCircleV((Vector2){ px + ts / 2, py + ts / 2 }, ts * 0.46f,

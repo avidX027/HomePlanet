@@ -82,6 +82,29 @@
 #define SPAWN_INTERVAL_START 14.0f      // spawner cooldown at evolution 0
 #define SPAWN_INTERVAL_END    5.0f      // ...and at evolution 1
 
+// ─── Wear, weather, and the ground itself ─────────────────
+// Blocks knit themselves back together slowly, so a wall you chipped
+// or a rock a mob gnawed doesn't stay scarred forever. The rate is
+// far below any weapon's DPS, so it never saves you mid-fight.
+#define TILE_HEAL_PER_SWEEP  0.55f   // health restored per full map sweep
+#define TILE_HEAL_TILES_PER_FRAME 6000  // how much of the map is checked/frame
+
+// Machines age. `machineWearScale` multiplies every service life in
+// TileServiceLife(), so the debug console can turn a 90-minute drill
+// into a 90-second one and let you WATCH the failure curve.
+#define MACHINE_WEAR_SCALE   1.0f
+// Past its rated life a machine decays asymptotically: gentle at
+// first, then all at once. This is the exponent on "how far past".
+#define MACHINE_DECAY_POWER  2.4f
+#define MACHINE_DECAY_RATE   0.9f    // health/sec at exactly 2x rated life
+
+// Quicksand: it halves your speed, and if you stand in it too long
+// it starts pulling you under.
+#define QUICKSAND_SLOW       0.42f
+#define QUICKSAND_GRACE      1.6f    // seconds before it starts hurting
+#define QUICKSAND_DPS        7.0f
+#define QUICKSAND_PATCHES    26
+
 // ─── Machines ─────────────────────────────────────────────
 #define TURRET_RANGE        260.0f
 #define TURRET_COOLDOWN     0.5f        // seconds between turret shots
@@ -141,6 +164,10 @@ typedef struct {
     float inserterInterval;
     float botSpeed;
     float botDPS;
+    // wear & world
+    float machineWearScale;   // x1 = the rated lives in gamedata.h
+    float tileHealRate;       // block self-repair per map sweep
+    float quicksandDPS;
 } Tuning;
 
 // C CONCEPT — designated initializers (.field = value) fill the
@@ -174,6 +201,9 @@ static Tuning TUNE = {
     .inserterInterval   = INSERTER_INTERVAL,
     .botSpeed           = BOT_SPEED,
     .botDPS             = BOT_DPS,
+    .machineWearScale   = MACHINE_WEAR_SCALE,
+    .tileHealRate       = TILE_HEAL_PER_SWEEP,
+    .quicksandDPS       = QUICKSAND_DPS,
 };
 
 #endif // CONFIG_H

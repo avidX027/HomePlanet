@@ -65,6 +65,31 @@ typedef struct {
     float   craftProgress;             // seconds into the head item
 } Player;
 
+// ─── State that rides ALONGSIDE the player ────────────────
+// These belong to the player conceptually, but they live outside the
+// struct on purpose — same as playerToasts below. The Player struct's
+// byte layout IS the save format, so leaving it untouched is what
+// lets a world saved before these features still load. They are
+// written and read as their own block at the tail of the file.
+//
+//   craftPaid[i]      has queue entry i had its ingredients taken?
+//   autoCraftOn[id]   keep this recipe topped up automatically
+//   autoCraftTarget   ...up to how many
+static bool  craftPaid[CRAFT_QUEUE_MAX];
+static bool  autoCraftOn[ITEM_COUNT];
+static int   autoCraftTarget[ITEM_COUNT];
+static float autoCraftTimer = 0;
+
+// How long you've been standing in quicksand. Past the grace period
+// it starts taking bites out of you.
+static float playerSinkTime = 0;
+
+// Death is expensive now: you drop EVERYTHING where you fell. player.h
+// can't make ground items (that's entities.h, which sits above it), so
+// it raises a flag and records the spot; main.c does the scattering.
+static bool    playerJustDied = false;
+static Vector2 playerDeathPos = { 0, 0 };
+
 // ─── Pickup toasts ────────────────────────────────────────
 // "+12 Stone" floating up over the player, Factorio-style. Repeats
 // of the same item MERGE into the live toast rather than stacking
@@ -130,8 +155,7 @@ static void PlayerInit(Player *p) {
     // C CONCEPT — pointers: `Player *p` receives the ADDRESS of a
     // Player, so p->pos edits the caller's struct, not a copy.
     // (p->pos is shorthand for (*p).pos.)
-    p->pos = (Vector2){ WORLD_SIZE * TILE_SIZE / 2.0f,
-                        WORLD_SIZE * TILE_SIZE / 2.0f };   // world center
+    p->pos = (Vector2){ WorldCenterPx(), WorldCenterPx() };   // world center
     for (int i = 0; i < ITEM_COUNT; i++) p->inventory[i] = 0;
     for (int i = 0; i < HOTBAR_MAX_SLOTS; i++) p->hotbar[i] = ITEM_NONE;
     p->selected      = ITEM_NONE;      // empty hands
@@ -164,7 +188,9 @@ static void PlayerInit(Player *p) {
     p->reloadingItem = ITEM_NONE;
     p->craftQueueCount = 0;
     p->craftProgress   = 0;
-    for (int i = 0; i < CRAFT_QUEUE_MAX; i++) p->craftQueue[i] = ITEM_NONE;
+    for (int i = 0; i < CRAFT_QUEUE_MAX; i++) { p->craftQueue[i] = ITEM_NONE; craftPaid[i] = false; }
+    for (int i = 0; i < ITEM_COUNT; i++) { autoCraftOn[i] = false; autoCraftTarget[i] = 0; }
+    autoCraftTimer = 0;
     for (int i = 0; i < MAX_TOASTS; i++) playerToasts[i].active = false;
 }
 
@@ -217,16 +243,26 @@ static void PlayerDamage(Player *p, float dmg) {
     p->hp -= dmg;
     p->hurtTimer  = 0.4f;
     p->regenDelay = 8.0f;      // getting hit pauses regeneration
+    SfxPlay(SFX_HURT, 0.5f, 1.0f);
     if (p->hp <= 0) {
-        // Death: respawn at the world center with full health and a
-        // grace period. You KEEP your items — the real penalty is
-        // the walk back (and whatever the mobs chew through while
-        // you're gone).
-        p->pos = (Vector2){ WORLD_SIZE * TILE_SIZE / 2.0f,
-                            WORLD_SIZE * TILE_SIZE / 2.0f };
+        // DEATH. You respawn at the world center with full health and
+        // a grace period — but everything you were carrying stays
+        // where you fell, in a heap on the ground. Dying in the waste
+        // now means a very deliberate walk back to your own corpse,
+        // through whatever killed you.
+        playerJustDied = true;
+        playerDeathPos = p->pos;
+        p->pos = (Vector2){ WorldCenterPx(), WorldCenterPx() };
         p->hp = PLAYER_MAX_HP;
         p->invulnTimer = 3.0f;
+        playerSinkTime = 0;
     }
+}
+
+// Do you have a gem charm in the pack? It doesn't need equipping —
+// carrying one is enough, which is what makes it worth the gems.
+static bool PlayerHasCharm(const Player *p) {
+    return p->inventory[ITEM_GEM_CHARM] > 0;
 }
 
 // Tick the health timers; slow regen after 8s without damage.
@@ -235,8 +271,21 @@ static void PlayerUpdateVitals(Player *p, float dt) {
     if (p->invulnTimer > 0) p->invulnTimer -= dt;
     if (p->regenDelay  > 0) p->regenDelay  -= dt;
     else if (p->hp < PLAYER_MAX_HP) {
-        p->hp += 2.0f * dt;
+        p->hp += (PlayerHasCharm(p) ? 7.0f : 2.0f) * dt;
         if (p->hp > PLAYER_MAX_HP) p->hp = PLAYER_MAX_HP;
+    }
+
+    // Quicksand: the tile you're standing on drags, and if you stay
+    // in it past the grace period it starts pulling you under.
+    int tx = (int)(p->pos.x / TILE_SIZE), ty = (int)(p->pos.y / TILE_SIZE);
+    if (WorldInBounds(tx, ty) && world[tx][ty].type == TILE_QUICKSAND) {
+        playerSinkTime += dt;
+        if (playerSinkTime > QUICKSAND_GRACE) {
+            PlayerDamage(p, TUNE.quicksandDPS * dt);
+        }
+    } else if (playerSinkTime > 0) {
+        playerSinkTime -= dt * 2.0f;          // climbing out is quick
+        if (playerSinkTime < 0) playerSinkTime = 0;
     }
 }
 
@@ -466,8 +515,7 @@ static void PlayerUnstick(Player *p) {
         }
     }
     // Nowhere within 4 tiles is free (buried alive) → world center.
-    p->pos = (Vector2){ WORLD_SIZE * TILE_SIZE / 2.0f,
-                        WORLD_SIZE * TILE_SIZE / 2.0f };
+    p->pos = (Vector2){ WorldCenterPx(), WorldCenterPx() };
 }
 
 // ─── Movement (WASD), clamped to world edges ──────────────
@@ -488,6 +536,10 @@ static void PlayerMove(Player *p, float dt) {
         // a weapon — a small nudge toward putting the gun away.
         float speed = TUNE.playerSpeed;
         if (!ItemIsWeapon(p->selected)) speed *= UNARMED_SPEED_BONUS;
+        // Wading through quicksand is exactly as slow as it looks.
+        int qtx = (int)(p->pos.x / TILE_SIZE), qty = (int)(p->pos.y / TILE_SIZE);
+        if (WorldInBounds(qtx, qty) && world[qtx][qty].type == TILE_QUICKSAND)
+            speed *= QUICKSAND_SLOW;
 
         float stepX = dir.x * speed * dt;
         float stepY = dir.y * speed * dt;
@@ -615,50 +667,261 @@ static bool PlayerCanCraft(const Player *p, ItemID id) {
     return true;
 }
 
-// Crafting takes TIME now. The ingredients are spent immediately
-// (so you can't queue ten things you can only afford once), the
-// build joins the queue, and the item appears when its timer runs
-// out — Factorio's model, and Rust's.
-static bool PlayerCraft(Player *p, ItemID id) {
-    if (p->craftQueueCount >= CRAFT_QUEUE_MAX) return false;
-    if (!PlayerCanCraft(p, id)) return false;
+// Take the ingredients out of your pockets. Only ever called after
+// PlayerCanCraft said yes.
+static void PlayerPayForCraft(Player *p, ItemID id) {
     const ItemInfo *it = &ITEMS[id];
     PlayerRemoveItem(p, it->inA, it->nA);
     if (it->inB != ITEM_NONE && !PlayerIsTool(it->inB))
         PlayerRemoveItem(p, it->inB, it->nB);
+}
+
+// ─── The queue's payment state ────────────────────────────
+// A queued build is either PAID (its ingredients are already spent —
+// the original behaviour) or WAITING: an intermediate that the entry
+// in FRONT of it hasn't produced yet. Waiting entries pay the moment
+// they reach the head, which is what makes chained crafting work.
+// (craftPaid[] itself is declared at the top of this file.)
+
+// Append one build. `paid` records whether we already charged for it.
+static bool PlayerQueueCraft(Player *p, ItemID id, bool paid) {
+    if (p->craftQueueCount >= CRAFT_QUEUE_MAX) return false;
+    craftPaid[p->craftQueueCount] = paid;
     p->craftQueue[p->craftQueueCount++] = id;
     return true;
+}
+
+// ─── Dependency planning ──────────────────────────────────
+// Clicking BULLET should just... make bullets — even when that means
+// smelting sulfur, mixing gunpowder, and only then pressing the
+// round. The planner walks the recipe tree against a SCRATCH COPY of
+// your inventory (`have`), reserving as it goes, and writes out the
+// builds in the order they must happen.
+//
+// Because every branch spends from that one scratch copy, the plan
+// can never promise the same ore to two different recipes. And
+// because the whole plan is checked BEFORE anything is queued, an
+// unaffordable click changes nothing at all.
+#define CRAFT_PLAN_MAX  32   // most builds one click may line up
+#define CRAFT_PLAN_DEPTH 6   // how deep the recipe tree may nest
+
+static bool CraftPlanNeed(const Player *p, ItemID id, int amount,
+                          int *have, ItemID *plan, int *n, int depth) {
+    if (id <= ITEM_NONE || id >= ITEM_COUNT || amount <= 0) return true;
+    if (have[id] >= amount) { have[id] -= amount; return true; }   // in stock
+
+    const ItemInfo *it = &ITEMS[id];
+    if (it->inA == ITEM_NONE) return false;          // raw material: go mine it
+    if (it->yield <= 0) return false;
+    if (!PlayerHasTech(p, it->tech)) return false;   // locked behind research
+    if (depth >= CRAFT_PLAN_DEPTH) return false;     // runaway guard
+
+    int missing = amount - have[id];
+    int batches = (missing + it->yield - 1) / it->yield;   // round up
+    for (int b = 0; b < batches; b++) {
+        if (!CraftPlanNeed(p, it->inA, it->nA, have, plan, n, depth + 1)) return false;
+        if (it->inB != ITEM_NONE) {
+            if (PlayerIsTool(it->inB)) {
+                // A tool (the furnace) is USED, not used up: build one
+                // if you don't own it, then hand it straight back.
+                if (!CraftPlanNeed(p, it->inB, 1, have, plan, n, depth + 1)) return false;
+                have[it->inB] += 1;
+            } else if (!CraftPlanNeed(p, it->inB, it->nB, have, plan, n, depth + 1)) {
+                return false;
+            }
+        }
+        if (*n >= CRAFT_PLAN_MAX) return false;
+        plan[(*n)++] = id;
+        have[id] += it->yield;
+    }
+    have[id] -= amount;
+    return true;
+}
+
+// Work out the full list of builds one click on `id` implies, newest
+// dependency first and `id` itself last. Returns how many (0 = it
+// can't be done from what you own). Touches nothing — the caller
+// decides whether to act on the answer, which is what lets the craft
+// menu ask "would this work?" purely to colour a border.
+static int PlayerBuildCraftPlan(const Player *p, ItemID id, ItemID *plan) {
+    if (id <= ITEM_NONE || id >= ITEM_COUNT) return 0;
+    const ItemInfo *it = &ITEMS[id];
+    if (it->inA == ITEM_NONE) return 0;                // no recipe
+    if (!PlayerHasTech(p, it->tech)) return 0;         // tech locked
+
+    int have[ITEM_COUNT];
+    for (int i = 0; i < ITEM_COUNT; i++) have[i] = p->inventory[i];
+
+    int n = 0;
+    // The TARGET is always built (never satisfied from stock — you
+    // asked for one more), so we plan its ingredients directly.
+    if (!CraftPlanNeed(p, it->inA, it->nA, have, plan, &n, 1)) return 0;
+    if (it->inB != ITEM_NONE) {
+        if (PlayerIsTool(it->inB)) {
+            if (!CraftPlanNeed(p, it->inB, 1, have, plan, &n, 1)) return 0;
+            have[it->inB] += 1;
+        } else if (!CraftPlanNeed(p, it->inB, it->nB, have, plan, &n, 1)) {
+            return 0;
+        }
+    }
+    if (n >= CRAFT_PLAN_MAX) return 0;
+    plan[n++] = id;
+    return n;
+}
+
+// Would a click on this recipe be accepted — counting the parts we'd
+// have to make first? (Green vs. red in the craft menu.)
+static bool PlayerCanCraftChain(const Player *p, ItemID id) {
+    ItemID plan[CRAFT_PLAN_MAX];
+    return PlayerBuildCraftPlan(p, id, plan) > 0;
+}
+
+// Crafting takes TIME. Ingredients you already own are spent
+// immediately (so you can't queue ten things you can only afford
+// once); intermediates the plan is about to build pay on arrival.
+// Returns false — and changes nothing — when the tree isn't
+// affordable from what you own.
+static bool PlayerCraft(Player *p, ItemID id) {
+    ItemID plan[CRAFT_PLAN_MAX];
+    int n = PlayerBuildCraftPlan(p, id, plan);
+    if (n <= 0) return false;
+    if (p->craftQueueCount + n > CRAFT_QUEUE_MAX) return false;
+    for (int i = 0; i < n; i++) {
+        bool paid = PlayerCanCraft(p, plan[i]);
+        if (paid) PlayerPayForCraft(p, plan[i]);
+        PlayerQueueCraft(p, plan[i], paid);
+    }
+    return true;
+}
+
+// Drop the head and slide everyone forward, payment flags included.
+static void PlayerCraftQueuePop(Player *p) {
+    for (int i = 1; i < p->craftQueueCount; i++) {
+        p->craftQueue[i - 1] = p->craftQueue[i];
+        craftPaid[i - 1]     = craftPaid[i];
+    }
+    p->craftQueueCount--;
+    p->craftQueue[p->craftQueueCount] = ITEM_NONE;
+    craftPaid[p->craftQueueCount] = false;
+    p->craftProgress = 0;
 }
 
 // Advance the head of the queue; deliver it when its time is up.
 static void PlayerUpdateCrafting(Player *p, float dt) {
     if (p->craftQueueCount <= 0) { p->craftProgress = 0; return; }
     ItemID head = p->craftQueue[0];
+
+    // A WAITING head pays as it starts — by now the entry in front of
+    // it has delivered the intermediate. If those ingredients went
+    // somewhere else meanwhile, the build is dropped rather than
+    // jamming everything behind it forever.
+    if (!craftPaid[0]) {
+        if (!PlayerCanCraft(p, head)) { PlayerCraftQueuePop(p); return; }
+        PlayerPayForCraft(p, head);
+        craftPaid[0] = true;
+    }
+
     float need = ItemCraftTime(head);
     p->craftProgress += dt;
     if (p->craftProgress < need) return;
 
-    p->craftProgress = 0;
     PlayerGiveItem(p, head, ITEMS[head].yield);
-    for (int i = 1; i < p->craftQueueCount; i++) p->craftQueue[i - 1] = p->craftQueue[i];
-    p->craftQueueCount--;
-    p->craftQueue[p->craftQueueCount] = ITEM_NONE;
+    PlayerCraftQueuePop(p);
 }
 
 // Cancel one queued build and refund it exactly — same numbers we
-// charged when it was queued.
+// charged when it was queued. A build still WAITING was never
+// charged, so there is nothing to give back.
 static void PlayerCancelCraftAt(Player *p, int index) {
     if (index < 0 || index >= p->craftQueueCount) return;
     ItemID id = p->craftQueue[index];
-    const ItemInfo *it = &ITEMS[id];
-    PlayerGiveItem(p, it->inA, it->nA);
-    if (it->inB != ITEM_NONE && !PlayerIsTool(it->inB)) PlayerGiveItem(p, it->inB, it->nB);
+    if (craftPaid[index]) {
+        const ItemInfo *it = &ITEMS[id];
+        PlayerGiveItem(p, it->inA, it->nA);
+        if (it->inB != ITEM_NONE && !PlayerIsTool(it->inB)) PlayerGiveItem(p, it->inB, it->nB);
+    }
 
-    for (int i = index + 1; i < p->craftQueueCount; i++) p->craftQueue[i - 1] = p->craftQueue[i];
+    for (int i = index + 1; i < p->craftQueueCount; i++) {
+        p->craftQueue[i - 1] = p->craftQueue[i];
+        craftPaid[i - 1]     = craftPaid[i];
+    }
     p->craftQueueCount--;
     p->craftQueue[p->craftQueueCount] = ITEM_NONE;
+    craftPaid[p->craftQueueCount] = false;
     // Cancelling the one in progress restarts the next from zero.
     if (index == 0) p->craftProgress = 0;
+}
+
+// ─── Smart auto-crafting ──────────────────────────────────
+// A toggle per recipe plus a target: "keep 50 bullets in stock".
+// Every heartbeat, anything below its target that the tree can
+// currently afford gets queued — dependencies and all. It never
+// queues twice for the same shortfall because the count includes
+// what the queue is already going to deliver, and it never queues
+// anything you can't pay for, because PlayerCraft refuses.
+//
+// Like craftPaid, this lives outside the Player struct so old saves
+// keep loading; it rides along in its own block of the save file.
+#define AUTO_TARGET_STEP 10
+#define AUTO_TARGET_MIN  10
+#define AUTO_TARGET_MAX  500
+#define AUTO_CRAFT_DEFAULT_TARGET 50
+
+static int AutoCraftCount(void) {
+    int n = 0;
+    for (ItemID id = 1; id < ITEM_COUNT; id++) if (autoCraftOn[id]) n++;
+    return n;
+}
+
+// The `slot`-th enabled recipe, in craft-menu order.
+static ItemID AutoCraftAt(int slot) {
+    int n = 0;
+    for (int row = 0; row < ITEM_COUNT; row++) {
+        ItemID id = CraftableAtRow(row);
+        if (id == ITEM_NONE) break;
+        if (!autoCraftOn[id]) continue;
+        if (n == slot) return id;
+        n++;
+    }
+    return ITEM_NONE;
+}
+
+static void AutoCraftToggle(ItemID id) {
+    if (id <= ITEM_NONE || id >= ITEM_COUNT) return;
+    if (ITEMS[id].inA == ITEM_NONE) return;      // nothing to automate
+    autoCraftOn[id] = !autoCraftOn[id];
+    if (autoCraftOn[id] && autoCraftTarget[id] < AUTO_TARGET_MIN)
+        autoCraftTarget[id] = AUTO_CRAFT_DEFAULT_TARGET;
+}
+
+static void AutoCraftAdjust(ItemID id, int delta) {
+    if (id <= ITEM_NONE || id >= ITEM_COUNT) return;
+    int t = autoCraftTarget[id] + delta;
+    if (t < AUTO_TARGET_MIN) t = AUTO_TARGET_MIN;
+    if (t > AUTO_TARGET_MAX) t = AUTO_TARGET_MAX;
+    autoCraftTarget[id] = t;
+}
+
+// How many of `id` the queue is already going to hand you.
+static int PlayerQueuedYield(const Player *p, ItemID id) {
+    int n = 0;
+    for (int i = 0; i < p->craftQueueCount; i++)
+        if (p->craftQueue[i] == id) n += ITEMS[id].yield;
+    return n;
+}
+
+static void PlayerUpdateAutoCraft(Player *p, float dt) {
+    autoCraftTimer -= dt;
+    if (autoCraftTimer > 0) return;
+    autoCraftTimer = 0.6f;                     // a heartbeat, not a hot loop
+    // Always leave room for a hand-clicked chain to fit.
+    if (p->craftQueueCount > CRAFT_QUEUE_MAX - CRAFT_PLAN_MAX) return;
+
+    for (ItemID id = 1; id < ITEM_COUNT; id++) {
+        if (!autoCraftOn[id] || ITEMS[id].inA == ITEM_NONE) continue;
+        if (p->inventory[id] + PlayerQueuedYield(p, id) >= autoCraftTarget[id]) continue;
+        PlayerCraft(p, id);       // one batch per beat; fails quietly when broke
+    }
 }
 
 #endif // PLAYER_H

@@ -19,6 +19,7 @@
 //  which lets us size arrays and write loops over all items.
 // ============================================================
 
+#include <stddef.h>   // NULL — the sprite table tests rows[0] against it
 #include "raylib.h"
 
 // ─── TILES (the world grid) ───────────────────────────────
@@ -41,6 +42,8 @@ typedef enum {
     TILE_LASER_TURRET,  // zaps mobs, no ammo, slower
     TILE_RESEARCH,      // the research computer (opens the tech tree)
     TILE_SPAWNER,       // mob nest — generated at the map edges
+    TILE_QUICKSAND,     // walkable, but it drags at you and then swallows
+    TILE_VOID,          // outside the active map: the edge of the world
     TILE_COUNT
 } TileType;
 
@@ -78,6 +81,9 @@ typedef enum {
     ITEM_METAL_WALL,      // places TILE_METAL_WALL
     ITEM_DOOR,            // places TILE_DOOR
     ITEM_GEM,
+    ITEM_CHITIN,          // cut from the natives; the only source
+    ITEM_GEM_PICK,        // gem-tipped pick: the early-game power spike
+    ITEM_GEM_CHARM,       // worn in the pack: you heal much faster
     ITEM_COUNT
 } ItemID;
 
@@ -126,6 +132,29 @@ static const TechInfo TECHS[TECH_COUNT] = {
 //  "one row = one item" safe.
 // ============================================================
 
+// ─── Craft menu groups ────────────────────────────────────
+// The craft menu is GROUPED, not one long alphabet soup: the things
+// you make over and over (sulfur → gunpowder → bullets) live in one
+// block at the top, and one-off gear like the pickaxe sits in its
+// own block far away. That distance IS the feature — a misclick can
+// no longer cost you a pickaxe when you meant bullets.
+typedef enum {
+    CAT_BASICS = 0,   // the repeat crafts: smelting, powder, ammo
+    CAT_LOGISTICS,    // belts, arms, drills, chests
+    CAT_MILITARY,     // guns, bombs, turrets
+    CAT_BUILDING,     // walls, doors, furnaces, the research computer
+    CAT_TOOLS,        // the pickaxe and friends
+    CAT_COUNT
+} CraftCat;
+
+static const char *CRAFT_CAT_NAMES[CAT_COUNT] = {
+    "SMELTING & AMMO",
+    "LOGISTICS",
+    "MILITARY",
+    "BUILDING",
+    "TOOLS",
+};
+
 typedef struct {
     const char *name;      // shown in UI
     Color       color;     // icon color in UI
@@ -139,6 +168,7 @@ typedef struct {
     TechID tech;           // research needed to craft it (TECH_NONE = none).
                            // Old rows omit this field — C fills missing
                            // trailing initializers with 0, i.e. TECH_NONE.
+    CraftCat cat;          // which block of the craft menu it lands in
 } ItemInfo;
 
 // NOTE — these tables used to be `const`. The F3 debug console
@@ -146,39 +176,45 @@ typedef struct {
 // now ordinary mutable arrays. The values below are the defaults
 // the console's RESET button restores.
 static ItemInfo ITEMS[ITEM_COUNT] = {
-    //                 name       color                    dps  places      placeable  inA        nA  inB        nB  yield
+    //                 name       color                    dps  places      placeable  inA        nA  inB        nB  yield  tech  cat
     [ITEM_NONE]    = { "Nothing", (Color){  0,  0,  0,255}, 0,  TILE_GRASS, false,     ITEM_NONE,  0, ITEM_NONE,  0, 0 },
     [ITEM_WOOD]         = { "Wood",        (Color){140, 90, 50,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
     [ITEM_RUBBER]       = { "Rubber",      (Color){ 30,150, 30,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
-    [ITEM_SMALL_STONE]  = { "Small Stone", (Color){120,120,120,255}, 0,  TILE_GRASS, false,     ITEM_STONE,      1, ITEM_NONE,    0, 4 },
+    [ITEM_SMALL_STONE]  = { "Small Stone", (Color){120,120,120,255}, 0,  TILE_GRASS, false,     ITEM_STONE,      1, ITEM_NONE,    0, 4, TECH_NONE,       CAT_BASICS },
     [ITEM_STONE]        = { "Stone",       (Color){110,110,120,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
     [ITEM_COAL]         = { "Coal",        (Color){ 60, 60, 60,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
     [ITEM_SULFUR_ORE]   = { "Sulfur Ore",  (Color){220,200, 30,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
-    [ITEM_SULFUR]       = { "Sulfur",      (Color){200,180, 40,255}, 0,  TILE_GRASS, false,     ITEM_SULFUR_ORE, 1, ITEM_FURNACE, 1, 1 },
+    [ITEM_SULFUR]       = { "Sulfur",      (Color){200,180, 40,255}, 0,  TILE_GRASS, false,     ITEM_SULFUR_ORE, 1, ITEM_FURNACE, 1, 1, TECH_NONE,       CAT_BASICS },
     [ITEM_METAL_ORE]    = { "Metal Ore",   (Color){140,140,180,255}, 0,  TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
-    [ITEM_METAL]        = { "Metal",       (Color){190,190,220,255}, 0,  TILE_GRASS, false,     ITEM_METAL_ORE,  1, ITEM_FURNACE, 1, 1 },
-    [ITEM_FURNACE]      = { "Furnace",     (Color){120,120,130,255}, 0,  TILE_GRASS, false,     ITEM_STONE,      6, ITEM_WOOD,    2, 1 },
-    [ITEM_GUNPOWDER]    = { "Gunpowder",   (Color){100,100,100,255}, 0,  TILE_GRASS, false,     ITEM_COAL,       1, ITEM_SULFUR,  1, 1 },
-    [ITEM_PISTOL]       = { "Pistol",      (Color){130,130,160,255}, 0,  TILE_GRASS, false,     ITEM_WOOD,       1, ITEM_METAL,   4, 1, TECH_BALLISTICS },
-    [ITEM_BULLET]       = { "Bullet",      (Color){220,190, 70,255}, 0,  TILE_GRASS, false,     ITEM_METAL,      1, ITEM_GUNPOWDER,1, 4, TECH_BALLISTICS },
-    [ITEM_PICKAXE]      = { "Pickaxe",     (Color){200,160,100,255}, 4,  TILE_GRASS, false,     ITEM_WOOD,       5, ITEM_STONE,  10, 1 },
-    [ITEM_SLINGSHOT]    = { "Slingshot",   (Color){120, 70, 30,255}, 0,  TILE_GRASS, false,     ITEM_WOOD,       3, ITEM_RUBBER, 1, 1 },
-    [ITEM_WALL]         = { "Wall",        (Color){180,180,190,255}, 0,  TILE_WALL,  true,      ITEM_STONE,      2, ITEM_NONE,    0, 4 },
-    [ITEM_SMG]          = { "SMG",         (Color){ 95, 95,115,255}, 0,  TILE_GRASS, false,     ITEM_METAL,      6, ITEM_RUBBER,  2, 1, TECH_ADV_WEAPONS },
-    [ITEM_SHOTGUN]      = { "Shotgun",     (Color){150,110, 60,255}, 0,  TILE_GRASS, false,     ITEM_WOOD,       4, ITEM_METAL,   6, 1, TECH_ADV_WEAPONS },
-    [ITEM_BOMB]         = { "Bomb",        (Color){ 70, 60, 60,255}, 0,  TILE_GRASS, false,     ITEM_GUNPOWDER,  4, ITEM_METAL,   2, 1, TECH_EXPLOSIVES },
-    [ITEM_DRILL]        = { "Mining Drill",(Color){185,145, 60,255}, 0,  TILE_DRILL, true,      ITEM_METAL,      8, ITEM_STONE,   4, 1, TECH_AUTOMATION },
-    [ITEM_CHEST]        = { "Chest",       (Color){170,130, 60,255}, 0,  TILE_CHEST, true,      ITEM_WOOD,       6, ITEM_METAL,   2, 1, TECH_AUTOMATION },
-    [ITEM_CONVEYOR]     = { "Conveyor",    (Color){190,170, 60,255}, 0,  TILE_CONVEYOR, true,   ITEM_METAL,      2, ITEM_RUBBER,  1, 2, TECH_LOGISTICS },
-    [ITEM_CONVEYOR_CORNER] = { "Belt Corner", (Color){205,150, 55,255}, 0, TILE_CONVEYOR_CORNER, true, ITEM_METAL, 2, ITEM_RUBBER, 1, 2, TECH_LOGISTICS },
-    [ITEM_INSERTER]     = { "Inserter",    (Color){225,160, 50,255}, 0,  TILE_INSERTER, true,   ITEM_METAL,      3, ITEM_RUBBER,  1, 1, TECH_LOGISTICS },
-    [ITEM_MINING_BOT]   = { "Mining Bot",  (Color){ 80,200,220,255}, 0,  TILE_GRASS, false,     ITEM_METAL,     12, ITEM_RUBBER,  6, 1, TECH_ROBOTICS },
-    [ITEM_TURRET]       = { "Gun Turret",  (Color){150,150,165,255}, 0,  TILE_TURRET, true,     ITEM_METAL,     10, ITEM_STONE,   5, 1, TECH_DEFENSE },
-    [ITEM_LASER_TURRET] = { "Laser Turret",(Color){220, 85, 85,255}, 0,  TILE_LASER_TURRET, true, ITEM_METAL,   15, ITEM_COAL,    8, 1, TECH_LASERS },
-    [ITEM_RESEARCH_COMPUTER] = { "Research Computer", (Color){ 70,160,220,255}, 0, TILE_RESEARCH, true, ITEM_WOOD, 8, ITEM_METAL, 4, 1 },
-    [ITEM_METAL_WALL]   = { "Metal Wall",  (Color){155,155,175,255}, 0,  TILE_METAL_WALL, true, ITEM_METAL,      3, ITEM_NONE,    0, 2, TECH_DEFENSE },
-    [ITEM_DOOR]         = { "Door",        (Color){150,100, 55,255}, 0,  TILE_DOOR,  true,      ITEM_WOOD,       4, ITEM_NONE,    0, 1 },
-    [ITEM_GEM]          = { "Gem",         (Color){3, 165, 252, 255}, 0, TILE_GRASS, false,    ITEM_NONE, 0, ITEM_NONE, 0, 1}
+    [ITEM_METAL]        = { "Metal",       (Color){190,190,220,255}, 0,  TILE_GRASS, false,     ITEM_METAL_ORE,  1, ITEM_FURNACE, 1, 1, TECH_NONE,       CAT_BASICS },
+    [ITEM_FURNACE]      = { "Furnace",     (Color){120,120,130,255}, 0,  TILE_GRASS, false,     ITEM_STONE,      6, ITEM_WOOD,    2, 1, TECH_NONE,       CAT_BUILDING },
+    [ITEM_GUNPOWDER]    = { "Gunpowder",   (Color){100,100,100,255}, 0,  TILE_GRASS, false,     ITEM_COAL,       1, ITEM_SULFUR,  1, 1, TECH_NONE,       CAT_BASICS },
+    [ITEM_PISTOL]       = { "Pistol",      (Color){130,130,160,255}, 0,  TILE_GRASS, false,     ITEM_WOOD,       1, ITEM_METAL,   4, 1, TECH_BALLISTICS, CAT_MILITARY },
+    [ITEM_BULLET]       = { "Bullet",      (Color){220,190, 70,255}, 0,  TILE_GRASS, false,     ITEM_METAL,      1, ITEM_GUNPOWDER,1, 4, TECH_BALLISTICS, CAT_BASICS },
+    [ITEM_PICKAXE]      = { "Pickaxe",     (Color){200,160,100,255}, 4,  TILE_GRASS, false,     ITEM_WOOD,       5, ITEM_STONE,  10, 1, TECH_NONE,       CAT_TOOLS },
+    [ITEM_SLINGSHOT]    = { "Slingshot",   (Color){120, 70, 30,255}, 0,  TILE_GRASS, false,     ITEM_WOOD,       3, ITEM_RUBBER, 1, 1, TECH_NONE,       CAT_MILITARY },
+    [ITEM_WALL]         = { "Wall",        (Color){180,180,190,255}, 0,  TILE_WALL,  true,      ITEM_STONE,      2, ITEM_NONE,    0, 4, TECH_NONE,       CAT_BUILDING },
+    [ITEM_SMG]          = { "SMG",         (Color){ 95, 95,115,255}, 0,  TILE_GRASS, false,     ITEM_METAL,      6, ITEM_RUBBER,  2, 1, TECH_ADV_WEAPONS, CAT_MILITARY },
+    [ITEM_SHOTGUN]      = { "Shotgun",     (Color){150,110, 60,255}, 0,  TILE_GRASS, false,     ITEM_WOOD,       4, ITEM_METAL,   6, 1, TECH_ADV_WEAPONS, CAT_MILITARY },
+    [ITEM_BOMB]         = { "Bomb",        (Color){ 70, 60, 60,255}, 0,  TILE_GRASS, false,     ITEM_GUNPOWDER,  4, ITEM_METAL,   2, 1, TECH_EXPLOSIVES, CAT_MILITARY },
+    [ITEM_DRILL]        = { "Mining Drill",(Color){185,145, 60,255}, 0,  TILE_DRILL, true,      ITEM_METAL,      8, ITEM_STONE,   4, 1, TECH_AUTOMATION, CAT_LOGISTICS },
+    [ITEM_CHEST]        = { "Chest",       (Color){170,130, 60,255}, 0,  TILE_CHEST, true,      ITEM_WOOD,       6, ITEM_METAL,   2, 1, TECH_AUTOMATION, CAT_LOGISTICS },
+    [ITEM_CONVEYOR]     = { "Conveyor",    (Color){190,170, 60,255}, 0,  TILE_CONVEYOR, true,   ITEM_METAL,      2, ITEM_RUBBER,  1, 2, TECH_LOGISTICS,  CAT_LOGISTICS },
+    [ITEM_CONVEYOR_CORNER] = { "Belt Corner", (Color){205,150, 55,255}, 0, TILE_CONVEYOR_CORNER, true, ITEM_METAL, 2, ITEM_RUBBER, 1, 2, TECH_LOGISTICS, CAT_LOGISTICS },
+    [ITEM_INSERTER]     = { "Inserter",    (Color){225,160, 50,255}, 0,  TILE_INSERTER, true,   ITEM_METAL,      3, ITEM_RUBBER,  1, 1, TECH_LOGISTICS,  CAT_LOGISTICS },
+    [ITEM_MINING_BOT]   = { "Mining Bot",  (Color){ 80,200,220,255}, 0,  TILE_GRASS, false,     ITEM_METAL,     12, ITEM_RUBBER,  6, 1, TECH_ROBOTICS,   CAT_LOGISTICS },
+    [ITEM_TURRET]       = { "Gun Turret",  (Color){150,150,165,255}, 0,  TILE_TURRET, true,     ITEM_METAL,     10, ITEM_STONE,   5, 1, TECH_DEFENSE,    CAT_MILITARY },
+    [ITEM_LASER_TURRET] = { "Laser Turret",(Color){220, 85, 85,255}, 0,  TILE_LASER_TURRET, true, ITEM_METAL,   15, ITEM_COAL,    8, 1, TECH_LASERS,     CAT_MILITARY },
+    [ITEM_RESEARCH_COMPUTER] = { "Research Computer", (Color){ 70,160,220,255}, 0, TILE_RESEARCH, true, ITEM_WOOD, 8, ITEM_METAL, 4, 1, TECH_NONE,       CAT_BUILDING },
+    [ITEM_METAL_WALL]   = { "Metal Wall",  (Color){155,155,175,255}, 0,  TILE_METAL_WALL, true, ITEM_METAL,      3, ITEM_NONE,    0, 2, TECH_DEFENSE,    CAT_BUILDING },
+    [ITEM_DOOR]         = { "Door",        (Color){150,100, 55,255}, 0,  TILE_DOOR,  true,      ITEM_WOOD,       4, ITEM_NONE,    0, 1, TECH_NONE,       CAT_BUILDING },
+    [ITEM_GEM]          = { "Gem",         (Color){3, 165, 252, 255}, 0, TILE_GRASS, false,    ITEM_NONE, 0, ITEM_NONE, 0, 1},
+    // Gems are the early-game jackpot: a couple of them buys a pick
+    // that mines three times faster than the stone one, which is the
+    // difference between an afternoon of punching rocks and a base.
+    [ITEM_CHITIN]       = { "Chitin",      (Color){160, 90,150,255},  0, TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
+    [ITEM_GEM_PICK]     = { "Gem Pick",    (Color){120,215,245,255}, 13, TILE_GRASS, false,     ITEM_GEM,        2, ITEM_WOOD,    3, 1, TECH_NONE,       CAT_TOOLS },
+    [ITEM_GEM_CHARM]    = { "Gem Charm",   (Color){ 90,235,215,255},  0, TILE_GRASS, false,     ITEM_GEM,        3, ITEM_CHITIN,  2, 1, TECH_NONE,       CAT_TOOLS },
 };
 
 typedef struct {
@@ -196,7 +232,7 @@ typedef struct {
 static TileInfo TILES[TILE_COUNT] = {
     //                      name             color                    maxHP  drops                     n  breakable walkable
     [TILE_GRASS]        = { "Grass",         (Color){ 40,150, 60,255},  1,   ITEM_NONE,                0, false, true  },
-    [TILE_TREE]         = { "Tree",          (Color){ 90, 60, 30,255},  4,   ITEM_WOOD,               10, true,  false },
+    [TILE_TREE]         = { "Tree",          (Color){ 90, 60, 30,255},  4,   ITEM_WOOD,                2, true,  false },
     [TILE_ROCK]         = { "Rock",          (Color){ 80, 80, 90,255},  8,   ITEM_STONE,              10, true,  false },
     [TILE_SULFUR_NODE]  = { "Sulfur Node",   (Color){198,178, 44,255}, 8,   ITEM_SULFUR_ORE,          3, true,  false },
     [TILE_METAL_NODE]   = { "Metal Node",    (Color){146,152,190,255}, 9,   ITEM_METAL_ORE,           3, true,  false },
@@ -215,6 +251,12 @@ static TileInfo TILES[TILE_COUNT] = {
     [TILE_LASER_TURRET] = { "Laser Turret",  (Color){110, 70, 70,255}, 18,   ITEM_LASER_TURRET,        1, true,  false },
     [TILE_RESEARCH]     = { "Research Comp.",(Color){ 45, 75,110,255}, 16,   ITEM_RESEARCH_COMPUTER,   1, true,  false },
     [TILE_SPAWNER]      = { "Mob Spawner",   (Color){ 90, 40,110,255}, 40,   ITEM_GEM,              5, true,  false },
+    // Walkable, but see PlayerMove: it halves your speed and starts
+    // pulling you under if you stand in it.
+    [TILE_QUICKSAND]    = { "Quicksand",     (Color){178,158,104,255},  1,   ITEM_NONE,             0, false, true  },
+    // The hard edge of the ACTIVE map (see worldSize). Unbreakable,
+    // unwalkable, and drawn as starfield — you simply can't go there.
+    [TILE_VOID]         = { "The Void",      (Color){  6,  6, 12,255},  1,   ITEM_NONE,             0, false, false },
 };
 
 // ─── Tile break loot ──────────────────────────────────────
@@ -224,6 +266,8 @@ static TileInfo TILES[TILE_COUNT] = {
 static void RollTileBreakDrops(TileType before, int out[ITEM_COUNT]) {
     for (int i = 0; i < ITEM_COUNT; i++) out[i] = 0;
     if (before == TILE_TREE) {
+        // A tree is TWO logs now, not ten. Wood was so abundant it
+        // made half the recipe costs meaningless.
         out[TILES[before].drops] += TILES[before].dropCount;
         if (GetRandomValue(1, 100) <= 20) out[ITEM_RUBBER] += 1;   // bonus rubber
         return;
@@ -236,6 +280,9 @@ static void RollTileBreakDrops(TileType before, int out[ITEM_COUNT]) {
         out[ITEM_COAL]  += GetRandomValue(1, 3);
         if (GetRandomValue(1, 100) <= 45) out[ITEM_SULFUR_ORE] += 1;
         if (GetRandomValue(1, 100) <= 35) out[ITEM_METAL_ORE] += 1;
+        // The early-game jackpot. Rare enough to be a moment, common
+        // enough that an hour of mining gets you a gem pick.
+        if (GetRandomValue(1, 100) <= 4)  out[ITEM_GEM] += 1;
         return;
     }
     if (before == TILE_SULFUR_NODE || before == TILE_METAL_NODE ||
@@ -290,6 +337,33 @@ static const ItemArt ITEM_ART[ITEM_COUNT] = {
         "..obbdd..",
         "...obd...",
         "....o...." } },
+    [ITEM_CHITIN] = { { 90, 40, 80, 255 }, {    // a carapace plate
+        "........",
+        "..oooo..",
+        ".obbllo.",
+        "obbbbbdo",
+        "osbbbdso",
+        ".osbddo.",
+        "..osso..",
+        "........" } },
+    [ITEM_GEM_PICK] = { { 120, 90, 55, 255 }, { // gem head, wood haft
+        "obo.....",
+        "obblo...",
+        ".oblbo..",
+        "..obdo..",
+        "...oso..",
+        "....oso.",
+        "....oso.",
+        ".....oo." } },
+    [ITEM_GEM_CHARM] = { { 210, 190, 90, 255 }, {  // gem on a cord
+        ".ssssss.",
+        "s......s",
+        "s..oo..s",
+        "..oblo..",
+        ".obblbo.",
+        ".obbbdo.",
+        "..obdo..",
+        "...oo..." } },
     [ITEM_WOOD] = { { 95, 60, 35, 255 }, {      // stacked planks
         "oooooooo",
         "obblbbdo",
@@ -497,15 +571,15 @@ static const ItemArt ITEM_ART[ITEM_COUNT] = {
         "otbbo...",
         "obbo....",
         "oo......" } },
-    [ITEM_INSERTER] = { { 150, 150, 160, 255 }, {  // claw, arm, base
-        "...oo...",
-        "..otto..",
-        "...bb...",
-        "...bb...",
+    [ITEM_INSERTER] = { { 150, 150, 160, 255 }, {  // swing arm: base,
+        "....o.o.",                                // jointed boom, and a
+        "....sss.",                                // two-prong gripper up
+        "...obbo.",                                // at the top right
         "..obbo..",
-        ".obddbo.",
-        ".oooooo.",
-        "........" } },
+        ".obbo...",
+        "obbo....",
+        "obbbbbdo",
+        "oddddddo" } },
     [ITEM_MINING_BOT] = { { 255, 160, 60, 255 }, {  // hover drone, eyes
         "..oooo..",
         ".oblbbo.",
@@ -720,6 +794,80 @@ static float ItemCraftTime(ItemID id) {
     return t;
 }
 
+// ─── The natives: one row per species ─────────────────────
+// Same data rule as items and tiles. The blob you already know is
+// row 0; the three spiders are new, and they don't sit at home
+// waiting for you — they RANGE, which is why you now want a weapon
+// before you wander off.
+//
+//   hp/speed/damage  multipliers on the tuned base values
+//   roam             how far from home it will wander (px). The
+//                    spiders' numbers are why the map feels occupied.
+//   rarity           relative weight when a nest breeds (0 = never)
+typedef enum {
+    MOB_BLOB = 0,      // the original: slow, clusters at its nest
+    MOB_SKITTER,       // small spider, fast, weak, comes in numbers
+    MOB_LURKER,        // mid spider, hunts wide, chews buildings
+    MOB_BROODMOTHER,   // the "super": rare, huge, and it does not stop
+    MOB_KIND_COUNT
+} MobKind;
+
+typedef struct {
+    const char *name;
+    Color  body;
+    float  hp, speed, damage;
+    float  size;        // draw radius in px
+    float  roam;        // wander radius from home
+    int    legs;        // 0 = blob, >0 = spider (drawn with legs)
+    int    rarity;      // breeding weight
+    ItemID drops; int dropMin, dropMax;
+} MobInfo;
+
+static const MobInfo MOBS_INFO[MOB_KIND_COUNT] = {
+    [MOB_BLOB]        = { "Crawler",     (Color){160, 60,130,255}, 1.0f, 1.00f, 1.0f,  7.0f,  260,  0, 46, ITEM_CHITIN, 1, 2 },
+    [MOB_SKITTER]     = { "Skitter",     (Color){190, 90, 70,255}, 0.6f, 1.55f, 0.7f,  5.5f, 1600, 8, 34, ITEM_CHITIN, 1, 1 },
+    [MOB_LURKER]      = { "Lurker",      (Color){120, 70,170,255}, 1.8f, 1.10f, 1.5f,  9.0f, 2400, 8, 17, ITEM_CHITIN, 2, 3 },
+    [MOB_BROODMOTHER] = { "Broodmother", (Color){230, 70, 90,255}, 6.0f, 0.95f, 2.6f, 15.0f, 3200, 8,  3, ITEM_CHITIN, 4, 7 },
+};
+
+// Roll a species for a fresh spawn, weighted by rarity — and gated
+// by evolution, so the horrors show up later, not on minute one.
+static MobKind RollMobKind(float evolution) {
+    int total = 0;
+    for (int k = 0; k < MOB_KIND_COUNT; k++) {
+        if (k == MOB_BROODMOTHER && evolution < 0.45f) continue;   // late game only
+        if (k == MOB_LURKER      && evolution < 0.15f) continue;
+        total += MOBS_INFO[k].rarity;
+    }
+    if (total <= 0) return MOB_BLOB;
+    int roll = GetRandomValue(1, total);
+    for (int k = 0; k < MOB_KIND_COUNT; k++) {
+        if (k == MOB_BROODMOTHER && evolution < 0.45f) continue;
+        if (k == MOB_LURKER      && evolution < 0.15f) continue;
+        roll -= MOBS_INFO[k].rarity;
+        if (roll <= 0) return (MobKind)k;
+    }
+    return MOB_BLOB;
+}
+
+// ─── Machine service life ─────────────────────────────────
+// Nothing runs forever. A machine counts the seconds it spends
+// WORKING (not the seconds it sits idle), and past its rated life it
+// starts to fail — see MachineWearDamage in entities.h. The numbers
+// are deliberately long: the point is that you forget machines can
+// break at all, and then one day your smelting line stops.
+static float TileServiceLife(TileType t) {
+    switch (t) {
+        case TILE_DRILL:        return 5400.0f;   // 90 minutes of drilling
+        case TILE_INSERTER:     return 7200.0f;   // arms are simple, they last
+        case TILE_CONVEYOR:
+        case TILE_CONVEYOR_CORNER: return 9000.0f;
+        case TILE_TURRET:       return 3600.0f;   // guns wear out fastest
+        case TILE_LASER_TURRET: return 4800.0f;
+        default:                return 0.0f;      // 0 = never wears out
+    }
+}
+
 // ─── Tile family helpers ──────────────────────────────────
 // Both belt kinds behave identically in the logistics code; only
 // their drawing differs. One predicate keeps that honest.
@@ -773,17 +921,47 @@ static int CraftableCount(void) {
     return n;
 }
 
-// Map a craft-menu row number back to an ItemID. The menu shows
-// recipes as rows 0,1,2,... but ITEMS[] has gaps (not every item is
-// craftable), so we walk the table counting only craftable items.
+// Map a craft-menu index back to an ItemID. The menu shows recipes
+// as 0,1,2,... but ITEMS[] has gaps (not every item is craftable),
+// so we walk the table counting only craftable items — CATEGORY BY
+// CATEGORY, so this order is exactly the order on screen (and the
+// order the arrow keys travel).
 static ItemID CraftableAtRow(int row) {
     int n = 0;
-    for (ItemID id = 1; id < ITEM_COUNT; id++) {
-        if (ITEMS[id].inA == ITEM_NONE) continue;  // skip non-craftables
-        if (n == row) return id;
-        n++;
+    for (int c = 0; c < CAT_COUNT; c++) {
+        for (ItemID id = 1; id < ITEM_COUNT; id++) {
+            if (ITEMS[id].inA == ITEM_NONE) continue;   // skip non-craftables
+            if ((int)ITEMS[id].cat != c) continue;      // not this group yet
+            if (n == row) return id;
+            n++;
+        }
     }
-    return ITEM_NONE;  // row out of range → "nothing"
+    return ITEM_NONE;  // index out of range → "nothing"
+}
+
+// The inverse: where does `want` sit in that order? -1 if it has no
+// recipe. (The auto-craft rail uses it to jump the selection.)
+static int CraftableIndexOf(ItemID want) {
+    int n = 0;
+    for (int c = 0; c < CAT_COUNT; c++) {
+        for (ItemID id = 1; id < ITEM_COUNT; id++) {
+            if (ITEMS[id].inA == ITEM_NONE) continue;
+            if ((int)ITEMS[id].cat != c) continue;
+            if (id == want) return n;
+            n++;
+        }
+    }
+    return -1;
+}
+
+// How many recipes sit in one group (0 = the group is empty and its
+// header is skipped entirely).
+static int CraftableCountInCat(int cat) {
+    int n = 0;
+    for (ItemID id = 1; id < ITEM_COUNT; id++) {
+        if (ITEMS[id].inA != ITEM_NONE && (int)ITEMS[id].cat == cat) n++;
+    }
+    return n;
 }
 
 #endif // GAMEDATA_H

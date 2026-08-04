@@ -81,7 +81,8 @@ static const struct { const char *keys; const char *action; } CONTROLS[] = {
     { "Right click",  "Open block panels; in crafting, craft 5" },
     { "Q",            "Close menus, draw / cycle weapons" },
     { "Z (drag)",     "Feed coal to drills / inserters" },
-    { "F (hold)",     "Pull items off nearby belts" },
+    { "F (hold)",     "Gather items off belts and off the ground" },
+    { "X",            "Drop one (Shift+X: the whole stack)" },
     { "Drag / Ctrl+click", "Move stacks between any open panels" },
     { "Mouse wheel",  "Cycle hotbar" },
     { "Ctrl + wheel", "Zoom camera" },
@@ -121,7 +122,11 @@ typedef struct {
 // including the machine pool's length. A stale block that still
 // passes the version check reads as garbage or fails halfway, and
 // the recovery path throws away state that looked fine on disk.
-#define SAVE_VERSION 6   // v6: 8192-machine pool, rage, craft queue
+#define SAVE_VERSION 7   // v7: loose ground items + auto-craft state
+// ...but v7 only APPENDED blocks; every struct it shares with v6 has
+// the same layout, and every new block is optional on read. So we
+// still accept v6 files instead of throwing away someone's world.
+#define SAVE_VERSION_MIN 6
 
 // (CraftableCount and CraftableAtRow used to live here; they moved
 // to gamedata.h because ui.h needs them too — pure table queries
@@ -234,19 +239,8 @@ static void ValidateLoadedPlayer(Player *p) {
     p->reloadingItem = ITEM_NONE;
     machineUiX = machineUiY = -1;   // no panel open across a load
 
-    // A craft queue from disk is untrusted: clamp its length and
-    // drop any entry that isn't a real recipe.
-    if (p->craftQueueCount < 0 || p->craftQueueCount > CRAFT_QUEUE_MAX) p->craftQueueCount = 0;
-    int keep = 0;
-    for (int i = 0; i < p->craftQueueCount; i++) {
-        ItemID q = p->craftQueue[i];
-        if (q > ITEM_NONE && q < ITEM_COUNT && ITEMS[q].inA != ITEM_NONE) {
-            p->craftQueue[keep++] = q;
-        }
-    }
-    p->craftQueueCount = keep;
-    for (int i = keep; i < CRAFT_QUEUE_MAX; i++) p->craftQueue[i] = ITEM_NONE;
-    if (p->craftProgress < 0) p->craftProgress = 0;
+    // (The craft queue is validated separately, once its payment
+    // flags have been read — see ValidateLoadedCraftQueue.)
     for (int i = 0; i < MAX_TOASTS; i++) playerToasts[i].active = false;
     if (p->techSel < 0 || p->techSel >= TECH_COUNT - 1) p->techSel = 0;
     if (p->techScroll < 0 || p->techScroll >= TECH_COUNT - 1) p->techScroll = 0;
@@ -255,6 +249,40 @@ static void ValidateLoadedPlayer(Player *p) {
     // meaningless after a load (and a hand-edited save could claim
     // both menus were open at once, which we never allow).
     PlayerCloseMenus(p);
+}
+
+// The craft queue and its payment flags are validated TOGETHER,
+// because they are two halves of one thing: entry i is refundable
+// only if craftPaid[i] says we charged for it. The flags live in
+// their own block at the TAIL of the save file (they aren't inside
+// the Player struct — see player.h), so this runs after that block
+// has been read, or defaulted when an older file doesn't carry one.
+static void ValidateLoadedCraftQueue(Player *p) {
+    if (p->craftQueueCount < 0 || p->craftQueueCount > CRAFT_QUEUE_MAX) p->craftQueueCount = 0;
+    int keep = 0;
+    for (int i = 0; i < p->craftQueueCount; i++) {
+        ItemID q = p->craftQueue[i];
+        if (q > ITEM_NONE && q < ITEM_COUNT && ITEMS[q].inA != ITEM_NONE) {
+            p->craftQueue[keep] = q;
+            craftPaid[keep] = craftPaid[i];   // the flag travels with its entry
+            keep++;
+        }
+    }
+    p->craftQueueCount = keep;
+    for (int i = keep; i < CRAFT_QUEUE_MAX; i++) {
+        p->craftQueue[i] = ITEM_NONE;
+        craftPaid[i] = false;
+    }
+    if (p->craftProgress < 0) p->craftProgress = 0;
+
+    // Auto-craft: only real recipes can be automated, and a target
+    // out of range would either spin forever or do nothing.
+    for (int i = 0; i < ITEM_COUNT; i++) {
+        if (ITEMS[i].inA == ITEM_NONE) autoCraftOn[i] = false;
+        if (autoCraftTarget[i] < AUTO_TARGET_MIN) autoCraftTarget[i] = AUTO_CRAFT_DEFAULT_TARGET;
+        if (autoCraftTarget[i] > AUTO_TARGET_MAX) autoCraftTarget[i] = AUTO_TARGET_MAX;
+    }
+    autoCraftTimer = 0;
 }
 
 // ─── Save & load ─────────────────────────────────────────────
@@ -277,7 +305,13 @@ static void GameSave(void) {
                                            // already "decays" to a pointer —
                                            // no & needed (unlike the structs).
     fwrite(worldExplored, sizeof(worldExplored), 1, f);   // your scouted fog
-    EntitiesWrite(f);   // machines, mobs, bots, the game clock
+    EntitiesWrite(f);   // machines, mobs, bots, ground items, the clock
+    // The tail: player state that lives ALONGSIDE the struct instead
+    // of inside it (see player.h). Written last, so a reader that
+    // doesn't know about it simply stops at the end of the entities.
+    fwrite(autoCraftOn,     sizeof(autoCraftOn),     1, f);
+    fwrite(autoCraftTarget, sizeof(autoCraftTarget), 1, f);
+    fwrite(craftPaid,       sizeof(craftPaid),       1, f);
     fclose(f);  // ALWAYS close what you open, or data may never hit disk.
 }
 
@@ -322,7 +356,8 @@ static bool GameLoad(void) {
     // version one we understand? If not, refuse the file. (Saves
     // from before the big world/mob update are version 1 — the
     // world size and player struct changed, so they can't load.)
-    if (memcmp(header.magic, SAVE_MAGIC, 4) != 0 || header.version != SAVE_VERSION) {
+    if (memcmp(header.magic, SAVE_MAGIC, 4) != 0 ||
+        header.version < SAVE_VERSION_MIN || header.version > SAVE_VERSION) {
         fclose(f);
         return false;
     }
@@ -353,6 +388,19 @@ static bool GameLoad(void) {
         EntitiesReset();
         EntitiesRegisterWorldMachines();
     }
+
+    // The v7 tail. A v6 file just ends before it, which is not an
+    // error — it means "no automation set up, and every queued build
+    // was paid for up front", which is exactly what v6 meant.
+    bool haveTail = (fread(autoCraftOn,     sizeof(autoCraftOn),     1, f) == 1);
+    haveTail = haveTail && (fread(autoCraftTarget, sizeof(autoCraftTarget), 1, f) == 1);
+    haveTail = haveTail && (fread(craftPaid,       sizeof(craftPaid),       1, f) == 1);
+    if (!haveTail) {
+        memset(autoCraftOn,     0, sizeof(autoCraftOn));
+        memset(autoCraftTarget, 0, sizeof(autoCraftTarget));
+        for (int i = 0; i < CRAFT_QUEUE_MAX; i++) craftPaid[i] = true;
+    }
+    ValidateLoadedCraftQueue(&player);
     fclose(f);
     worldMinimapDirty = true;   // new map on screen → new minimap
     return true;
@@ -638,6 +686,21 @@ static void DrawPlacementGhost(void) {
     }
 }
 
+// ─── Putting things down ─────────────────────────────────────
+// Where does a dropped stack land? A tile in front of you, on the
+// side you're looking at — unless that tile is solid, in which case
+// it lands at your feet. Nothing is ever dropped inside a rock,
+// because a pile you can't walk to is a pile you've lost.
+static Vector2 PlayerDropSpot(void) {
+    Vector2 aim = GetScreenToWorld2D(GetMousePosition(), camera);
+    Vector2 dir = Vector2Subtract(aim, player.pos);
+    if (Vector2Length(dir) < 1.0f) dir = (Vector2){ 1, 0 };
+    dir = Vector2Normalize(dir);
+    Vector2 spot = Vector2Add(player.pos, Vector2Scale(dir, TILE_SIZE * 0.9f));
+    if (!GroundTileFree((int)(spot.x / TILE_SIZE), (int)(spot.y / TILE_SIZE))) spot = player.pos;
+    return spot;
+}
+
 // ─── One frame of gameplay ───────────────────────────────────
 // DESIGN CHANGE — menus no longer pause the world. Mobs keep
 // marching while you dig through your backpack (rust-like: the
@@ -812,6 +875,34 @@ static void UpdateGame(float dt) {
                     if (!(!srcPlayer && hoverMachine == uiDragIndex)) {
                         SlotTransfer(from, MachineSlotRef(panelM, hoverMachine));
                     }
+                } else {
+                    // Released out over the WORLD → throw the stack on
+                    // the ground. Only when the cursor is clear of
+                    // every open panel: letting go over a panel's
+                    // background is a cancelled drag, not a toss.
+                    bool overPanel = (UiHotbarSlotAt(&player, mouse) >= 0);
+                    if (haveInv) {
+                        Rectangle ir = { (float)invLayout.panelX, (float)invLayout.panelY,
+                                         (float)invLayout.panelW, (float)invLayout.panelH };
+                        if (CheckCollisionPointRec(mouse, ir)) overPanel = true;
+                    }
+                    if (panelM != NULL) {
+                        Rectangle mr = { (float)machLayout.x, (float)machLayout.y,
+                                         (float)machLayout.w, (float)machLayout.h };
+                        if (CheckCollisionPointRec(mouse, mr)) overPanel = true;
+                    }
+                    if (player.craftMenuOpen) {
+                        CraftLayout cl = { 0 };
+                        UiGetCraftLayout(&player, &cl);
+                        Rectangle cr = { (float)cl.x, (float)cl.y, (float)cl.w, (float)cl.h };
+                        if (CheckCollisionPointRec(mouse, cr)) overPanel = true;
+                    }
+                    if (!overPanel && *from.id != ITEM_NONE && *from.count > 0) {
+                        if (DropItemAt(PlayerDropSpot(), *from.id, *from.count)) {
+                            *from.id = ITEM_NONE;
+                            *from.count = 0;
+                        }
+                    }
                 }
                 PlayerRecount(&player);   // totals are always derived
             }
@@ -827,14 +918,21 @@ static void UpdateGame(float dt) {
         UiGetCraftLayout(&player, &craftLayout);
         int n = CraftableCount();
         int cols = craftLayout.cols;
-        int gridRows = (n + cols - 1) / cols;    // total grid rows
-        int visibleRows = craftLayout.visibleRows;
+        // The grouped row list — built by the SAME function the
+        // drawing uses, so a click can never land on a cell that
+        // isn't where it appears.
+        CraftRow rows[CRAFT_MAX_ROWS];
+        int rowCount = UiBuildCraftRows(cols, rows, CRAFT_MAX_ROWS);
+        int maxScroll = UiCraftMaxScroll(&craftLayout, rows, rowCount);
+        int ys[CRAFT_MAX_ROWS];
+
         if (n > 0) {
             // The recipe count can change live (the debug console can
             // delete recipes), so drag the selection back into range.
             if (player.craftSel >= n) player.craftSel = n - 1;
+            if (player.craftSel < 0)  player.craftSel = 0;
 
-            // The mouse wheel scrolls the grid WINDOW by rows, from
+            // The mouse wheel scrolls the WINDOW by rows, from
             // anywhere on screen; the selection stays put.
             float wheel = GetMouseWheelMove();
             if (wheel > 0) player.craftScroll--;
@@ -853,39 +951,76 @@ static void UpdateGame(float dt) {
                 if (next >= 0 && next < n) player.craftSel = next;
                 // Keyboard drags the window along to keep the
                 // selection visible; wheel scrolling doesn't.
-                int selRow = player.craftSel / cols;
-                if (selRow < player.craftScroll) {
-                    player.craftScroll = selRow;
-                } else if (selRow >= player.craftScroll + visibleRows) {
-                    player.craftScroll = selRow - visibleRows + 1;
+                int selRow = UiCraftRowOfIndex(rows, rowCount, player.craftSel);
+                if (selRow < player.craftScroll) player.craftScroll = selRow;
+                int guard = 0;
+                while (guard++ < CRAFT_MAX_ROWS && player.craftScroll < maxScroll) {
+                    int vis = UiCraftVisibleRows(&craftLayout, rows, rowCount,
+                                                 player.craftScroll, ys, CRAFT_MAX_ROWS);
+                    if (selRow < player.craftScroll + vis) break;
+                    player.craftScroll++;
                 }
+                // Keep a group's heading on screen with its first row.
+                if (selRow > 0 && rows[selRow - 1].header &&
+                    player.craftScroll >= selRow) player.craftScroll = selRow - 1;
             }
-            // Clamp the window to the grid (second line wins when
-            // the grid is shorter than the window).
-            if (player.craftScroll > gridRows - visibleRows) player.craftScroll = gridRows - visibleRows;
+            if (player.craftScroll > maxScroll) player.craftScroll = maxScroll;
             if (player.craftScroll < 0) player.craftScroll = 0;
         }
         if (IsKeyPressed(KEY_ENTER)) PlayerCraft(&player, CraftableAtRow(player.craftSel));
 
+        // ── The auto-craft rail ──────────────────────────────
+        // It sits ON TOP of the panel, so it claims the click before
+        // the grid can see it. `railClaimed` is how it says so
+        // without bailing out of the whole frame.
+        bool railClaimed = false;
+        if (craftLayout.railW > 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            Vector2 mp = GetMousePosition();
+            ItemID selId = CraftableAtRow(player.craftSel);
+            if (CheckCollisionPointRec(mp, UiCraftAutoButtonRect(&craftLayout))) {
+                AutoCraftToggle(selId);       // automate what's selected
+                railClaimed = true;
+            }
+            for (int slot = 0; !railClaimed && slot < craftLayout.autoRows; slot++) {
+                ItemID id = AutoCraftAt(slot);
+                if (id == ITEM_NONE) continue;
+                if (CheckCollisionPointRec(mp, UiCraftAutoOffRect(&craftLayout, slot))) {
+                    AutoCraftToggle(id);
+                    railClaimed = true;
+                } else if (CheckCollisionPointRec(mp, UiCraftAutoMinusRect(&craftLayout, slot))) {
+                    AutoCraftAdjust(id, -AUTO_TARGET_STEP);
+                    railClaimed = true;
+                } else if (CheckCollisionPointRec(mp, UiCraftAutoPlusRect(&craftLayout, slot))) {
+                    AutoCraftAdjust(id, AUTO_TARGET_STEP);
+                    railClaimed = true;
+                } else if (CheckCollisionPointRec(mp, UiCraftAutoRowRect(&craftLayout, slot))) {
+                    int idx = CraftableIndexOf(id);   // jump the grid to it
+                    if (idx >= 0) player.craftSel = idx;
+                    railClaimed = true;
+                }
+            }
+        }
 
-        
         // Mouse: hover (when actually moving) selects a cell; left
-        // click crafts ONE, right click crafts a batch of FIVE.
-        // Cell rects come from ui.h (UiCraftCellRect) — the same
-        // function the drawing uses, so click targets match pixels.
+        // click crafts ONE, right click crafts a batch of FIVE. Both
+        // go through PlayerCraft, which queues any missing
+        // intermediates ahead of what you asked for.
         Vector2 mouseDelta = GetMouseDelta();
         bool mouseMoved = (mouseDelta.x != 0.0f || mouseDelta.y != 0.0f);
-        for (int r = 0; r < visibleRows; r++) {
-            for (int c = 0; c < cols; c++) {
-                int idx = (player.craftScroll + r) * cols + c;
-                if (idx >= n) break;
-                UIButton cellButton = { UiCraftCellRect(&craftLayout, r, c), "", false, false };
+        int shown = UiCraftVisibleRows(&craftLayout, rows, rowCount,
+                                       player.craftScroll, ys, CRAFT_MAX_ROWS);
+        for (int r = 0; r < shown; r++) {
+            const CraftRow *row = &rows[player.craftScroll + r];
+            if (row->header) continue;               // headings aren't clickable
+            for (int c = 0; c < row->count; c++) {
+                UIButton cellButton = { UiCraftCellRect(&craftLayout, ys[r], c), "", false, false };
                 UiButtonUpdate(&cellButton);
-                if (cellButton.hovered && mouseMoved) player.craftSel = idx;
-                if (cellButton.clicked) PlayerCraft(&player, CraftableAtRow(idx));
+                if (cellButton.hovered && mouseMoved) player.craftSel = row->idx[c];
+                if (railClaimed) continue;
+                if (cellButton.clicked) PlayerCraft(&player, row->ids[c]);
                 if (cellButton.hovered && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
                     for (int batch = 0; batch < 5; batch++) {
-                        if (!PlayerCraft(&player, CraftableAtRow(idx))) break;
+                        if (!PlayerCraft(&player, row->ids[c])) break;
                     }
                 }
             }
@@ -1041,6 +1176,20 @@ static void UpdateGame(float dt) {
             }
         }
 
+        // X — set items down on the ground in front of you. A tap
+        // drops one, Shift+X empties the stack. What lands is a real
+        // pile: you can walk back over it, and so can an inserter.
+        if (IsKeyPressed(KEY_X) && player.selected != ITEM_NONE) {
+            int slot = player.selectedSlot;
+            if (slot >= 0 && slot < INVENTORY_SIZE && player.inventoryAmounts[slot] > 0) {
+                bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+                int amount = shift ? player.inventoryAmounts[slot] : 1;
+                if (DropItemAt(PlayerDropSpot(), player.inventorySlots[slot], amount)) {
+                    PlayerRemoveSelectedItem(&player, amount);
+                }
+            }
+        }
+
         // Clicking the on-screen hotbar selects that slot. The
         // hit-test (UiHotbarSlotAt) shares its layout math with
         // UiDrawHotbar, so click targets always match pixels.
@@ -1094,6 +1243,7 @@ static void UpdateGame(float dt) {
     PlayerUpdateVitals(&player, dt);
     PlayerUpdateReload(&player, dt);
     PlayerUpdateCrafting(&player, dt);
+    PlayerUpdateAutoCraft(&player, dt);   // keep the toggled recipes stocked
     PlayerUpdateToasts(dt);
     WorldRevealAround(player.pos, FOW_REVEAL_TILES);   // push back the fog
     EntitiesUpdate(dt, &player);   // mobs, machines, bots, bullets, bombs

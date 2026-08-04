@@ -79,9 +79,28 @@ typedef struct {
 // Craft-menu geometry, shared by drawing (here) and click handling
 // (main.c). ONE function computes it so the clickable rectangles
 // always match the drawn pixels — same idea as InventoryLayout.
-// The menu is a GRID of item cells (scrollable by row) with a
-// detail box underneath for the selected recipe — so long recipe
-// text lives in a fixed box instead of running off the screen.
+//
+// The menu is a GRID of item cells, split into labelled GROUPS
+// (smelting & ammo, logistics, military, ...) with a detail box
+// underneath and an AUTO-CRAFT rail down the right-hand side. The
+// grouping is not decoration: the things you make forty times an
+// hour sit together at the top, and the pickaxe sits in its own
+// block at the bottom where your cursor never goes by accident.
+#define CRAFT_MAX_ROWS    48
+#define CRAFT_MAX_COLS     8
+#define UI_CRAFT_GROUP_H  24    // height of a group heading row
+#define UI_AUTO_ROW_H     46    // height of one auto-craft rail row
+
+// One visual row of the grid: either a GROUP HEADING or a run of
+// recipe cells. Both drawing and hit-testing walk the same rows.
+typedef struct {
+    bool   header;
+    int    cat;                    // heading: which group
+    ItemID ids[CRAFT_MAX_COLS];    // cells: the recipes on this row...
+    int    idx[CRAFT_MAX_COLS];    // ...and their craft-menu indices
+    int    count;
+} CraftRow;
+
 typedef struct {
     int x, y;           // top-left of the panel
     int w, h;           // panel size
@@ -90,7 +109,10 @@ typedef struct {
     int cellH;          // cell height = width + a strip for the name
     int gap;
     int gridX, gridY;   // top-left of the cell grid
-    int visibleRows;    // grid rows on screen at once
+    int gridW;          // width of the recipe column (rail sits right of it)
+    int rowH;           // pitch of one row of cells
+    int railX, railW;   // the auto-craft rail
+    int autoRows;       // how many rail entries fit
     int detailY;        // top of the recipe-detail box
     int detailH;
 } CraftLayout;
@@ -136,7 +158,9 @@ static int UiInventoryPanelW(const Player *p) {
     return UiClampW(470, 260, UiPanelBudget(p));
 }
 static int UiCraftPanelW(const Player *p) {
-    return UiClampW(470, 250, UiPanelBudget(p));
+    // Deliberately the widest panel of the three: it carries a grid,
+    // a detail box AND the auto-craft rail.
+    return UiClampW(740, 400, UiPanelBudget(p));
 }
 static int UiMachinePanelW(const Player *p, const Machine *m) {
     int cols = (m != NULL && m->type == TILE_CHEST) ? 7
@@ -171,36 +195,151 @@ static int UiDockX(const Player *p, int which, const Machine *m) {
 
 static void UiGetCraftLayout(const Player *p, CraftLayout *layout) {
     int sh = GetScreenHeight();
-    layout->cols = 6;
     layout->gap = 8;
     layout->w = UiCraftPanelW(p);
-    layout->detailH = 88;
+    layout->detailH = 96;
 
-    // Cell size follows from the panel width, so cells shrink
-    // gracefully as panels crowd each other.
-    layout->cellSize = (layout->w - 48 - (layout->cols - 1) * layout->gap) / layout->cols;
-    if (layout->cellSize < 26) layout->cellSize = 26;
-    layout->cellH = layout->cellSize + 13;   // name strip under the sprite
+    // The rail takes a fixed slice off the right; the recipe grid
+    // gets what's left, and the cells size themselves to fill it.
+    layout->railW = (layout->w >= 560) ? 182 : 152;
+    layout->gridW = layout->w - layout->railW - 46;
+    if (layout->gridW < 160) {          // absurdly narrow window: drop the rail
+        layout->railW = 0;
+        layout->gridW = layout->w - 40;
+    }
+    layout->cols = layout->gridW / 66;   // ~64px cells: big targets, few misclicks
+    if (layout->cols < 3) layout->cols = 3;
+    if (layout->cols > CRAFT_MAX_COLS) layout->cols = CRAFT_MAX_COLS;
+    layout->cellSize = (layout->gridW - (layout->cols - 1) * layout->gap) / layout->cols;
+    if (layout->cellSize < 30) layout->cellSize = 30;
+    layout->cellH = layout->cellSize + 14;   // name strip under the sprite
+    layout->rowH  = layout->cellH + layout->gap;
 
-    layout->h = UI_HEADER_H + 16 + 4 * (layout->cellH + layout->gap) + layout->detailH + 28;
+    // Tall on purpose — the whole point is to see more at once.
+    layout->h = sh - 40;
+    if (layout->h > 780)   layout->h = 780;
     if (layout->h > sh - 16) layout->h = sh - 16;
     layout->x = UiDockX(p, UI_PANEL_CRAFT, MachineAt(machineUiX, machineUiY));
     layout->y = (sh - layout->h) / 2;
 
-    layout->gridX = layout->x + 24;
-    layout->gridY = layout->y + UI_HEADER_H + 14;
+    layout->gridX = layout->x + 20;
+    layout->gridY = layout->y + UI_HEADER_H + 30;   // room for the column labels
+    layout->railX = layout->x + layout->w - layout->railW - 16;
     layout->detailY = layout->y + layout->h - layout->detailH - 14;
-    // However many rows fit between the header and the detail strip.
-    layout->visibleRows = (layout->detailY - 8 - layout->gridY) / (layout->cellH + layout->gap);
-    if (layout->visibleRows < 2) layout->visibleRows = 2;
-    if (layout->visibleRows > 8) layout->visibleRows = 8;
+
+    // (How many rows actually fit is worked out row by row in
+    // UiCraftVisibleRows — headings and cell rows are different
+    // heights, so there is no single "rows per screen" number.)
+
+    // Rail: a big toggle button, then as many list rows as fit.
+    layout->autoRows = (layout->detailY - 12 - (layout->gridY + 42)) / UI_AUTO_ROW_H;
+    if (layout->autoRows < 0) layout->autoRows = 0;
+    if (layout->autoRows > 8) layout->autoRows = 8;
+    if (layout->railW == 0) layout->autoRows = 0;
 }
 
-// Screen rectangle of the cell at visible row r, column c.
-static Rectangle UiCraftCellRect(const CraftLayout *layout, int r, int c) {
+// ─── The grouped row list ─────────────────────────────────
+// Walks the recipes in craft-menu order (which is grouped, see
+// CraftableAtRow) and lays them out as heading rows and cell rows.
+// Called by BOTH the drawing here and the input in main.c, so a
+// click can never land on a cell that isn't where it looks.
+static int UiBuildCraftRows(int cols, CraftRow *rows, int maxRows) {
+    if (cols > CRAFT_MAX_COLS) cols = CRAFT_MAX_COLS;
+    if (cols < 1) cols = 1;
+    int n = 0, order = 0;
+    for (int c = 0; c < CAT_COUNT; c++) {
+        int inCat = CraftableCountInCat(c);
+        if (inCat <= 0) continue;               // empty group: no heading
+        if (n >= maxRows) break;
+        rows[n].header = true; rows[n].cat = c; rows[n].count = 0;
+        n++;
+        int placed = 0;
+        while (placed < inCat && n < maxRows) {
+            CraftRow *r = &rows[n];
+            r->header = false; r->cat = c; r->count = 0;
+            for (int k = 0; k < cols && placed < inCat; k++) {
+                r->ids[r->count] = CraftableAtRow(order);
+                r->idx[r->count] = order;
+                r->count++;
+                order++; placed++;
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
+static int UiCraftRowHeight(const CraftLayout *l, const CraftRow *row) {
+    return row->header ? UI_CRAFT_GROUP_H : l->rowH;
+}
+
+// Fill outY[] with the screen y of each row starting at `scroll`,
+// and return how many of them actually fit above the detail box.
+static int UiCraftVisibleRows(const CraftLayout *l, const CraftRow *rows, int rowCount,
+                              int scroll, int *outY, int maxOut) {
+    int limit = l->detailY - 10;
+    int y = l->gridY, shown = 0;
+    for (int i = scroll; i < rowCount && shown < maxOut; i++) {
+        int h = UiCraftRowHeight(l, &rows[i]);
+        if (y + h > limit) break;
+        outY[shown++] = y;
+        y += h;
+    }
+    return shown;
+}
+
+// The furthest you can scroll before the list just shows blank space.
+static int UiCraftMaxScroll(const CraftLayout *l, const CraftRow *rows, int rowCount) {
+    int avail = l->detailY - 10 - l->gridY;
+    int used = 0, first = rowCount > 0 ? rowCount - 1 : 0;
+    for (int i = rowCount - 1; i >= 0; i--) {
+        int h = UiCraftRowHeight(l, &rows[i]);
+        if (used + h > avail) break;
+        used += h;
+        first = i;
+    }
+    return first;
+}
+
+// Which row holds craft-menu index `idx`? (Keyboard navigation uses
+// it to drag the window along with the selection.)
+static int UiCraftRowOfIndex(const CraftRow *rows, int rowCount, int idx) {
+    for (int i = 0; i < rowCount; i++) {
+        if (rows[i].header) continue;
+        for (int k = 0; k < rows[i].count; k++) if (rows[i].idx[k] == idx) return i;
+    }
+    return 0;
+}
+
+// Screen rectangle of the cell in column c of a row drawn at `rowY`.
+static Rectangle UiCraftCellRect(const CraftLayout *layout, int rowY, int c) {
     return (Rectangle){ (float)(layout->gridX + c * (layout->cellSize + layout->gap)),
-                        (float)(layout->gridY + r * (layout->cellH + layout->gap)),
+                        (float)rowY,
                         (float)layout->cellSize, (float)layout->cellH };
+}
+
+// ─── Auto-craft rail rectangles ───────────────────────────
+// The big button adds/removes the SELECTED recipe; each list row
+// below it owns one automated recipe, with -/+ target buttons and an
+// [x] to switch it off.
+static Rectangle UiCraftAutoButtonRect(const CraftLayout *l) {
+    return (Rectangle){ (float)l->railX, (float)l->gridY, (float)l->railW, 34.0f };
+}
+static Rectangle UiCraftAutoRowRect(const CraftLayout *l, int slot) {
+    return (Rectangle){ (float)l->railX, (float)(l->gridY + 42 + slot * UI_AUTO_ROW_H),
+                        (float)l->railW, (float)(UI_AUTO_ROW_H - 6) };
+}
+static Rectangle UiCraftAutoMinusRect(const CraftLayout *l, int slot) {
+    Rectangle r = UiCraftAutoRowRect(l, slot);
+    return (Rectangle){ r.x + 6, r.y + r.height - 21, 22, 17 };
+}
+static Rectangle UiCraftAutoPlusRect(const CraftLayout *l, int slot) {
+    Rectangle r = UiCraftAutoRowRect(l, slot);
+    return (Rectangle){ r.x + r.width - 28, r.y + r.height - 21, 22, 17 };
+}
+static Rectangle UiCraftAutoOffRect(const CraftLayout *l, int slot) {
+    Rectangle r = UiCraftAutoRowRect(l, slot);
+    return (Rectangle){ r.x + r.width - 22, r.y + 4, 18, 16 };
 }
 
 static void UiDrawButton(const UIButton *button) {
@@ -393,7 +532,7 @@ static void UiDrawInventory(const Player *p) {
     }
 }
 
-// ─── Crafting menu (TAB) — a scrollable GRID of recipes ───
+// ─── Crafting menu (TAB) — grouped GRID + auto-craft rail ─
 static void UiDrawCraftMenu(const Player *p) {
     if (!p->craftMenuOpen) return;
     CraftLayout layout = { 0 };
@@ -404,25 +543,43 @@ static void UiDrawCraftMenu(const Player *p) {
     UiDrawPanelFrame(mx, my, mw, mh, "CRAFTING");
 
     int n = CraftableCount();
-    int rows = (n + layout.cols - 1) / layout.cols;   // grid rows total
-    int startRow = p->craftScroll;
+    CraftRow rows[CRAFT_MAX_ROWS];
+    int rowCount = UiBuildCraftRows(layout.cols, rows, CRAFT_MAX_ROWS);
+    int ys[CRAFT_MAX_ROWS];
+    int shown = UiCraftVisibleRows(&layout, rows, rowCount, p->craftScroll, ys, CRAFT_MAX_ROWS);
+
+    DrawText("RECIPES", layout.gridX, layout.gridY - 20, 13, (Color){ 170, 170, 176, 255 });
+    if (layout.railW > 0) {
+        DrawText("AUTO-CRAFT", layout.railX, layout.gridY - 20, 13, UI_ACCENT);
+    }
 
     // The cells. Slots are Factorio-gray; the accent border carries
-    // the meaning: orange = selected, green = craftable, red =
-    // missing materials, dim + veil = tech-locked.
-    for (int r = 0; r < layout.visibleRows; r++) {
-        for (int c = 0; c < layout.cols; c++) {
-            int idx = (startRow + r) * layout.cols + c;
-            if (idx >= n) break;
-            ItemID id = CraftableAtRow(idx);
-            Rectangle cell = UiCraftCellRect(&layout, r, c);
+    // the meaning: orange = selected, green = craftable (counting
+    // what it can make from parts), red = missing materials, dim +
+    // veil = tech-locked.
+    for (int r = 0; r < shown; r++) {
+        const CraftRow *row = &rows[p->craftScroll + r];
+        if (row->header) {
+            // Group heading: a label with a rule running off it.
+            const char *title = CRAFT_CAT_NAMES[row->cat];
+            int tw = MeasureText(title, 13);
+            DrawText(title, layout.gridX, ys[r] + 7, 13, (Color){ 232, 196, 120, 255 });
+            DrawRectangle(layout.gridX + tw + 10, ys[r] + 13,
+                          layout.gridW - tw - 10, 1, (Color){ 96, 88, 70, 255 });
+            continue;
+        }
+        for (int c = 0; c < row->count; c++) {
+            ItemID id = row->ids[c];
+            int idx = row->idx[c];
+            Rectangle cell = UiCraftCellRect(&layout, ys[r], c);
             bool sel    = (idx == p->craftSel);
-            bool ok     = PlayerCanCraft(p, id);
+            bool ok     = PlayerCanCraft(p, id);          // straight from stock
+            bool chain  = !ok && PlayerCanCraftChain(p, id);  // ...or via parts
             bool locked = !PlayerHasTech(p, ITEMS[id].tech);
 
             DrawRectangleRec(cell, sel ? UI_SLOT_HOVER : UI_SLOT_BG);
-            float icon = cell.width - 22;
-            DrawItemSprite(id, cell.x + (cell.width - icon) / 2, cell.y + 5, icon);
+            float icon = cell.width - 24;
+            DrawItemSprite(id, cell.x + (cell.width - icon) / 2, cell.y + 6, icon);
             if (locked) {
                 DrawRectangleRec(cell, (Color){ 20, 20, 22, 170 });
                 DrawText("?", (int)(cell.x + cell.width - 13), (int)cell.y + 3, 16, UI_ACCENT);
@@ -430,6 +587,11 @@ static void UiDrawCraftMenu(const Player *p) {
                 DrawText(TextFormat("x%d", ITEMS[id].yield),
                          (int)(cell.x + cell.width - 22), (int)cell.y + 4, 12,
                          (Color){ 255, 255, 255, 190 });
+            }
+            // An automated recipe wears a little orange A.
+            if (autoCraftOn[id]) {
+                DrawRectangle((int)cell.x + 3, (int)cell.y + 3, 13, 13, UI_ACCENT);
+                DrawText("A", (int)cell.x + 6, (int)cell.y + 4, 11, (Color){ 30, 24, 10, 255 });
             }
             // The item's name in small print under the sprite —
             // scissored to the cell so long names can't escape.
@@ -443,22 +605,103 @@ static void UiDrawCraftMenu(const Player *p) {
                      locked ? GRAY : LIGHTGRAY);
             EndScissorMode();
 
+            // The border says what a click would do: green = build it
+            // right now, blue = buildable, but the parts get made
+            // first, red = you're missing raw material, dim = locked.
             Color border = locked ? (Color){ 70, 70, 74, 255 }
-                                  : (ok ? (Color){ 96, 178, 96, 255 }
-                                        : (Color){ 168, 78, 78, 255 });
+                         : (ok    ? (Color){ 96, 178, 96, 255 }
+                         : (chain ? (Color){ 92, 132, 196, 255 }
+                                  : (Color){ 168, 78, 78, 255 }));
             if (sel) border = UI_ACCENT;
             DrawRectangleLinesEx(cell, sel ? 2 : 1, border);
         }
     }
 
-    // Scrollbar, when there's more than a screenful.
-    if (rows > layout.visibleRows) {
-        int barX = mx + mw - 16;
-        int trackH = layout.visibleRows * (layout.cellH + layout.gap) - layout.gap;
-        DrawRectangle(barX, layout.gridY, 6, trackH, (Color){ 38, 38, 40, 255 });
-        float thumbH = trackH * ((float)layout.visibleRows / rows);
-        float thumbY = layout.gridY + (trackH - thumbH) * ((float)startRow / (rows - layout.visibleRows));
-        DrawRectangle(barX, (int)thumbY, 6, (int)thumbH, (Color){ 130, 130, 134, 255 });
+    // Scrollbar, when the list is taller than the window.
+    if (shown < rowCount) {
+        int barX = layout.gridX + layout.gridW + 4;
+        int trackTop = layout.gridY, trackH = layout.detailY - 10 - layout.gridY;
+        DrawRectangle(barX, trackTop, 6, trackH, (Color){ 38, 38, 40, 255 });
+        float thumbH = trackH * ((float)shown / rowCount);
+        if (thumbH < 18) thumbH = 18;
+        float t = (rowCount - shown > 0) ? (float)p->craftScroll / (rowCount - shown) : 0;
+        if (t > 1) t = 1;
+        DrawRectangle(barX, (int)(trackTop + (trackH - thumbH) * t), 6, (int)thumbH,
+                      (Color){ 130, 130, 134, 255 });
+    }
+
+    // ── The auto-craft rail ──────────────────────────────
+    if (layout.railW > 0) {
+        ItemID selId = (p->craftSel >= 0 && p->craftSel < n) ? CraftableAtRow(p->craftSel)
+                                                             : ITEM_NONE;
+        Rectangle btn = UiCraftAutoButtonRect(&layout);
+        bool on = (selId != ITEM_NONE && autoCraftOn[selId]);
+        bool hov = CheckCollisionPointRec(GetMousePosition(), btn);
+        DrawRectangleRec(btn, on ? (Color){ 122, 74, 26, 255 }
+                                 : (hov ? (Color){ 66, 66, 70, 255 } : UI_SLOT_BG));
+        DrawRectangleLinesEx(btn, 1, on ? UI_ACCENT : UI_SLOT_BORDER);
+        if (selId != ITEM_NONE) {
+            DrawItemSprite(selId, btn.x + 6, btn.y + 7, 20);
+            const char *label = on ? "STOP AUTO" : "AUTO-CRAFT";
+            DrawText(label, (int)btn.x + 32, (int)btn.y + 10, 14,
+                     on ? (Color){ 255, 214, 150, 255 } : RAYWHITE);
+        }
+
+        // An empty rail explains itself rather than sitting there
+        // being mysterious.
+        if (AutoCraftCount() == 0 && layout.autoRows > 0) {
+            Rectangle r = UiCraftAutoRowRect(&layout, 0);
+            DrawText("Nothing automated.", (int)r.x + 6, (int)r.y + 4, 11,
+                     (Color){ 156, 156, 164, 255 });
+            DrawText("Pick a recipe, then", (int)r.x + 6, (int)r.y + 18, 11,
+                     (Color){ 156, 156, 164, 255 });
+            DrawText("hit AUTO-CRAFT.", (int)r.x + 6, (int)r.y + 32, 11,
+                     (Color){ 156, 156, 164, 255 });
+        }
+
+        for (int slot = 0; slot < layout.autoRows; slot++) {
+            ItemID id = AutoCraftAt(slot);
+            Rectangle r = UiCraftAutoRowRect(&layout, slot);
+            if (id == ITEM_NONE) {
+                // Empty berth — drawn faintly so the rail reads as a
+                // list with room in it, not as a broken panel.
+                DrawRectangleLinesEx(r, 1, (Color){ 66, 66, 70, 255 });
+                continue;
+            }
+            int stock = p->inventory[id];
+            int target = autoCraftTarget[id];
+            bool full = stock >= target;
+            DrawRectangleRec(r, UI_SLOT_BG);
+            DrawRectangleLinesEx(r, 1, full ? (Color){ 96, 178, 96, 255 } : UI_ACCENT);
+            DrawItemSprite(id, r.x + 5, r.y + 4, 18);
+            BeginScissorMode((int)r.x + 26, (int)r.y + 3, (int)r.width - 50, 14);
+            DrawText(ITEMS[id].name, (int)r.x + 26, (int)r.y + 4, 12, RAYWHITE);
+            EndScissorMode();
+
+            // Progress toward the target, as a thin bar.
+            float frac = (target > 0) ? (float)stock / target : 0;
+            if (frac > 1) frac = 1;
+            int barX = (int)r.x + 6, barY = (int)r.y + 21, barW = (int)r.width - 12;
+            DrawRectangle(barX, barY, barW, 4, (Color){ 32, 32, 34, 255 });
+            DrawRectangle(barX, barY, (int)(barW * frac), 4,
+                          full ? (Color){ 96, 178, 96, 255 } : UI_ACCENT);
+
+            Rectangle minus = UiCraftAutoMinusRect(&layout, slot);
+            Rectangle plus  = UiCraftAutoPlusRect(&layout, slot);
+            Rectangle off   = UiCraftAutoOffRect(&layout, slot);
+            Vector2 mp = GetMousePosition();
+            DrawRectangleRec(minus, CheckCollisionPointRec(mp, minus)
+                             ? (Color){ 80, 80, 86, 255 } : (Color){ 58, 58, 62, 255 });
+            DrawRectangleRec(plus, CheckCollisionPointRec(mp, plus)
+                             ? (Color){ 80, 80, 86, 255 } : (Color){ 58, 58, 62, 255 });
+            DrawText("-", (int)minus.x + 9, (int)minus.y + 1, 15, RAYWHITE);
+            DrawText("+", (int)plus.x + 7, (int)plus.y + 1, 15, RAYWHITE);
+            DrawText(TextFormat("%d / %d", stock, target),
+                     (int)r.x + 34, (int)minus.y + 2, 12, (Color){ 210, 214, 224, 255 });
+            DrawRectangleRec(off, CheckCollisionPointRec(mp, off)
+                             ? (Color){ 170, 62, 62, 255 } : (Color){ 58, 58, 62, 255 });
+            DrawText("x", (int)off.x + 6, (int)off.y + 1, 13, RAYWHITE);
+        }
     }
 
     // Detail box: the selected recipe's full story, in a box that
@@ -493,6 +736,9 @@ static void UiDrawCraftMenu(const Player *p) {
         }
         DrawText(TextFormat("owned: %d", p->inventory[id]),
                  (int)(detail.x + detail.width) - 90, dy + 2, 14, LIGHTGRAY);
+        // Plain ASCII: raylib's built-in font has no dashes or bullets.
+        DrawText("click: craft (missing parts get queued first)    right-click: craft 5",
+                 dx, (int)(detail.y + detail.height) - 20, 12, (Color){ 160, 166, 178, 255 });
     }
     (void)mw; (void)mh;
 }
@@ -710,8 +956,11 @@ static void UiDrawDragGhost(void) {
 // The queue STACKS upward from just above the health bar: one bar
 // per pending build, the live one at the bottom. Each carries its
 // own [x] to cancel and refund that entry.
-#define UI_QUEUE_ROW_H 34
-#define UI_QUEUE_MAX_SHOWN 6
+// TEN rows, not six: a chain craft can queue half a dozen
+// intermediates on its own, and every one of them needs to be
+// visible long enough that you can still hit its [x].
+#define UI_QUEUE_ROW_H 32
+#define UI_QUEUE_MAX_SHOWN 10
 
 static Rectangle UiCraftQueueRect(int index) {
     float bottom = (float)(GetScreenHeight() - 160);
@@ -736,17 +985,24 @@ static void UiDrawCraftQueue(const Player *p) {
         float frac = (i == 0 && need > 0) ? (p->craftProgress / need) : 0.0f;
         if (frac < 0) frac = 0;
         if (frac > 1) frac = 1;
+        // A build whose ingredients haven't been taken yet is an
+        // INTERMEDIATE: the entry in front of it is making its parts.
+        bool waiting = !craftPaid[i];
 
-        DrawRectangleRec(r, (Color){ 10, 10, 16, 215 });
+        DrawRectangleRec(r, waiting ? (Color){ 14, 16, 26, 215 } : (Color){ 10, 10, 16, 215 });
         if (frac > 0) {
             DrawRectangle((int)r.x, (int)r.y, (int)(r.width * frac), (int)r.height,
                           (Color){ 60, 110, 70, 235 });
         }
-        DrawRectangleLinesEx(r, 1, i == 0 ? UI_ACCENT : UI_PANEL_BORDER);
-        DrawItemSprite(id, r.x + 4, r.y + 4, 26);
-        DrawText(ITEMS[id].name, (int)r.x + 36, (int)r.y + 4, 14, RAYWHITE);
-        DrawText(i == 0 ? TextFormat("%.1fs", need - p->craftProgress) : "queued",
-                 (int)r.x + 36, (int)r.y + 19, 11, (Color){ 200, 210, 225, 220 });
+        DrawRectangleLinesEx(r, 1, i == 0 ? UI_ACCENT
+                                          : (waiting ? (Color){ 92, 110, 150, 255 }
+                                                     : UI_PANEL_BORDER));
+        DrawItemSprite(id, r.x + 4, r.y + 3, 25);
+        DrawText(ITEMS[id].name, (int)r.x + 36, (int)r.y + 3, 14,
+                 waiting ? (Color){ 186, 198, 224, 255 } : RAYWHITE);
+        DrawText(i == 0 ? TextFormat("%.1fs", need - p->craftProgress)
+                        : (waiting ? "needs parts first" : "queued"),
+                 (int)r.x + 36, (int)r.y + 18, 11, (Color){ 200, 210, 225, 220 });
 
         Rectangle x = UiCraftQueueCancelRect(i);
         bool hov = CheckCollisionPointRec(GetMousePosition(), x);

@@ -49,6 +49,7 @@ typedef struct {
     TileType type;
     int      dir;               // conveyor/inserter facing (see DIR_DX)
     float    timer;             // generic cooldown (spawner/drill/turret...)
+    float    workHours;         // SECONDS SPENT WORKING — see wear, below
     ItemID   slots[MACHINE_SLOTS];
     int      counts[MACHINE_SLOTS];
     int      ammo;              // gun turrets: loaded bullets
@@ -88,7 +89,11 @@ static void UiDragClear(void) {
 static short machineIndex[WORLD_SIZE][WORLD_SIZE];
 
 // ─── Mobs ─────────────────────────────────────────────────
-#define MAX_MOBS 96
+// Now four species (gamedata.h's MOBS_INFO holds their stats), and
+// the spiders among them RANGE — they don't sit politely at their
+// nest waiting to be farmed. A mob can also be carrying something it
+// tore out of one of your chests, which it drops when it dies.
+#define MAX_MOBS 160
 enum { MOB_IDLE = 0, MOB_RAID };
 typedef struct {
     bool    active;
@@ -99,6 +104,11 @@ typedef struct {
     int     state;
     float   retarget;    // seconds until it picks a new destination
     float   rage;        // >0 = enraged: faster, and it hunts YOU
+    unsigned char kind;  // which MOBS_INFO row it is
+    ItemID  loot;        // stolen goods, dropped when it dies
+    int     lootN;
+    float   chirp;       // countdown to its next noise
+    float   legPhase;    // spider gait animation
 } Mob;
 static Mob mobs[MAX_MOBS];
 
@@ -133,14 +143,37 @@ static Bomb bombs[MAX_BOMBS];
 // Effects come in flavors now: explosion rings, muzzle flashes,
 // and little impact sparks — the seasoning that makes shooting
 // feel like SHOOTING.
-enum { EFFECT_RING = 0, EFFECT_FLASH, EFFECT_SPARK };
-#define MAX_EFFECTS 48
-typedef struct { bool active; int kind; Vector2 pos; float age, life, maxRadius; } Effect;
+enum { EFFECT_RING = 0, EFFECT_FLASH, EFFECT_SPARK, EFFECT_DEBRIS };
+#define MAX_EFFECTS 64
+typedef struct {
+    bool active; int kind; Vector2 pos; float age, life, maxRadius;
+    Color tint;          // debris takes the colour of whatever broke
+    unsigned int seed;   // ...and its chunks fly in a fixed direction
+} Effect;
 static Effect effects[MAX_EFFECTS];
 
 #define MAX_BEAMS 16
 typedef struct { bool active; Vector2 from, to; float ttl; } Beam;
 static Beam beams[MAX_BEAMS];
+
+// ─── Items lying on the ground ────────────────────────────
+// Factorio's floor. An inserter with nowhere to hand its cargo sets
+// it down; an inserter with nothing behind it picks the floor back
+// up; you drop things with X and hoover them up by walking over
+// them. Piles of the same item MERGE, so an arm unloading onto one
+// tile forever stays ONE entry instead of eating the whole pool.
+#define MAX_GROUND_ITEMS    512
+#define GROUND_MERGE_DIST   9.0f    // px — closer than this is the same pile
+#define GROUND_PICKUP_DIST  16.0f   // px — walk this close and it's yours
+#define GROUND_PICKUP_DELAY 0.8f    // s — grace, so you don't re-grab your own drop
+typedef struct {
+    bool    active;
+    Vector2 pos;
+    ItemID  id;
+    int     count;
+    float   age;
+} GroundItem;
+static GroundItem groundItems[MAX_GROUND_ITEMS];
 
 // Screen shake: anything violent adds to this; main.c jitters the
 // camera by it and it decays fast. Small numbers, big feel.
@@ -167,6 +200,7 @@ static void EntitiesReset(void) {
     memset(bombs, 0, sizeof(bombs));
     memset(effects, 0, sizeof(effects));
     memset(beams, 0, sizeof(beams));
+    memset(groundItems, 0, sizeof(groundItems));
     for (int x = 0; x < WORLD_SIZE; x++)
         for (int y = 0; y < WORLD_SIZE; y++) machineIndex[x][y] = -1;
     entGameTime = 0;
@@ -325,6 +359,101 @@ static ItemID MachineTakeItem(Machine *m) {
     return ITEM_NONE;
 }
 
+// Pop ONE item of a SPECIFIC kind. This is what lets an arm hunt for
+// coal in a chest full of ore instead of grabbing the first thing it
+// touches and jamming with cargo the destination won't accept.
+static ItemID MachineTakeSpecific(Machine *m, ItemID want) {
+    if (m == NULL || want <= ITEM_NONE) return ITEM_NONE;
+    for (int s = 0; s < MachineSlotCount(m); s++) {
+        if (m->slots[s] != want || m->counts[s] <= 0) continue;
+        if (--m->counts[s] <= 0) { m->slots[s] = ITEM_NONE; m->counts[s] = 0; }
+        return want;
+    }
+    return ITEM_NONE;
+}
+
+// ─── The floor ────────────────────────────────────────────
+// Set items down at a world position, merging into a nearby pile of
+// the same kind first. Returns false only when the pool is full and
+// nothing could merge — in which case the caller keeps holding them.
+static bool DropItemAt(Vector2 pos, ItemID id, int count) {
+    if (id <= ITEM_NONE || id >= ITEM_COUNT || count <= 0) return false;
+    for (int i = 0; i < MAX_GROUND_ITEMS; i++) {
+        if (!groundItems[i].active || groundItems[i].id != id) continue;
+        if (Vector2Distance(groundItems[i].pos, pos) > GROUND_MERGE_DIST) continue;
+        groundItems[i].count += count;
+        groundItems[i].age = 0;
+        return true;
+    }
+    for (int i = 0; i < MAX_GROUND_ITEMS; i++) {
+        if (groundItems[i].active) continue;
+        groundItems[i] = (GroundItem){ true, pos, id, count, 0 };
+        return true;
+    }
+    return false;
+}
+
+// Take ONE item off whatever is lying on tile (tx,ty). `want` of
+// ITEM_NONE means "anything". This is the arm's pickup.
+static ItemID GroundTakeOneAt(int tx, int ty, ItemID want) {
+    for (int i = 0; i < MAX_GROUND_ITEMS; i++) {
+        GroundItem *g = &groundItems[i];
+        if (!g->active || g->count <= 0) continue;
+        if (want != ITEM_NONE && g->id != want) continue;
+        if ((int)(g->pos.x / TILE_SIZE) != tx || (int)(g->pos.y / TILE_SIZE) != ty) continue;
+        ItemID id = g->id;
+        if (--g->count <= 0) g->active = false;
+        return id;
+    }
+    return ITEM_NONE;
+}
+
+// Can loose items sit on this tile? Open ground only — nothing gets
+// dropped inside a rock or a wall.
+static bool GroundTileFree(int tx, int ty) {
+    if (tx < 0 || tx >= WORLD_SIZE || ty < 0 || ty >= WORLD_SIZE) return false;
+    return TILES[world[tx][ty].type].walkable;
+}
+
+// Sweep everything within `radius` of `at` into the player's pockets.
+// `minAge` keeps a stack you just threw down from leaping straight
+// back into your hands.
+static void GroundPickupNear(Player *p, Vector2 at, float radius, float minAge) {
+    for (int i = 0; i < MAX_GROUND_ITEMS; i++) {
+        GroundItem *g = &groundItems[i];
+        if (!g->active || g->count <= 0 || g->age < minAge) continue;
+        if (Vector2Distance(g->pos, at) > radius) continue;
+        // Take only what FITS. A full backpack leaves the rest of the
+        // pile lying there instead of quietly deleting it.
+        int before = p->inventory[g->id];
+        PlayerGiveItem(p, g->id, g->count);
+        int took = p->inventory[g->id] - before;
+        if (took >= g->count) g->active = false;
+        else if (took > 0)    g->count -= took;
+    }
+}
+
+// ─── An arm that feeds itself ─────────────────────────────
+// Look for one lump of coal: first the tile the arm draws FROM, then
+// its four neighbours — in a chest, on a belt, in a drill's output,
+// or lying on the floor. One lump is all it takes; COAL_FUEL_SECONDS
+// later it comes back for another. This is what makes a belt of coal
+// running past a row of arms keep the whole row alive.
+static bool InserterSelfFuel(Machine *m) {
+    if (m == NULL || m->coal >= MACHINE_FUEL_MAX) return false;
+    for (int k = -1; k < 4; k++) {
+        int nx = (k < 0) ? m->x - DIR_DX[m->dir] : m->x + DIR_DX[k];
+        int ny = (k < 0) ? m->y - DIR_DY[m->dir] : m->y + DIR_DY[k];
+        Machine *n = MachineAt(nx, ny);
+        if (n != NULL && n != m &&
+            (n->type == TILE_CHEST || n->type == TILE_DRILL || TileIsBelt(n->type))) {
+            if (MachineTakeSpecific(n, ITEM_COAL) != ITEM_NONE) { m->coal++; return true; }
+        }
+        if (GroundTakeOneAt(nx, ny, ITEM_COAL) != ITEM_NONE) { m->coal++; return true; }
+    }
+    return false;
+}
+
 static void MachineGiveContentsTo(Machine *m, Player *p) {
     if (m == NULL || p == NULL) return;
     for (int s = 0; s < MACHINE_SLOTS; s++) {
@@ -336,13 +465,33 @@ static void MachineGiveContentsTo(Machine *m, Player *p) {
     if (m->coal > 0) { PlayerGiveItem(p, ITEM_COAL, m->coal);   m->coal = 0; }
 }
 
+// Everything inside a machine, thrown onto the floor around it. This
+// is what happens when something is DESTROYED rather than mined: a
+// chest the mobs tore open spills its contents across the ground
+// instead of quietly deleting a thousand plates.
+static void MachineDropContents(Machine *m) {
+    if (m == NULL) return;
+    Vector2 at = { (m->x + 0.5f) * TILE_SIZE, (m->y + 0.5f) * TILE_SIZE };
+    for (int s = 0; s < MACHINE_SLOTS; s++) {
+        if (m->slots[s] != ITEM_NONE && m->counts[s] > 0) {
+            Vector2 spill = { at.x + GetRandomValue(-9, 9), at.y + GetRandomValue(-9, 9) };
+            DropItemAt(spill, m->slots[s], m->counts[s]);
+        }
+        m->slots[s] = ITEM_NONE; m->counts[s] = 0;
+    }
+    if (m->ammo > 0) { DropItemAt(at, ITEM_BULLET, m->ammo); m->ammo = 0; }
+    if (m->coal > 0) { DropItemAt(at, ITEM_COAL,   m->coal); m->coal = 0; }
+}
+
 // Remove the machine on a tile (it broke). If `giveTo` is non-NULL
-// the contents are salvaged into that player's inventory; mobs and
-// explosions pass NULL — destruction is lossy.
+// the contents are salvaged straight into that player's inventory
+// (you mined it); otherwise they hit the FLOOR, where you — or the
+// thing that broke it — can pick them back up.
 static void RemoveMachineAt(int x, int y, Player *giveTo) {
     Machine *m = MachineAt(x, y);
     if (m == NULL) return;
     if (giveTo != NULL) MachineGiveContentsTo(m, giveTo);
+    else                MachineDropContents(m);
     machineIndex[x][y] = -1;
     m->active = false;
 }
@@ -371,13 +520,43 @@ static void EntitiesRegisterWorldMachines(void) {
 }
 
 // ─── Effects ──────────────────────────────────────────────
-static void AddEffect(int kind, Vector2 pos, float maxRadius, float life) {
+static void AddEffectTinted(int kind, Vector2 pos, float maxRadius, float life, Color tint) {
     for (int i = 0; i < MAX_EFFECTS; i++) {
         if (!effects[i].active) {
-            effects[i] = (Effect){ true, kind, pos, 0, life, maxRadius };
+            effects[i] = (Effect){ true, kind, pos, 0, life, maxRadius, tint,
+                                   (unsigned int)GetRandomValue(1, 100000) };
             return;
         }
     }
+}
+
+static void AddEffect(int kind, Vector2 pos, float maxRadius, float life) {
+    AddEffectTinted(kind, pos, maxRadius, life, (Color){ 255, 190, 80, 255 });
+}
+
+// ─── Something broke: make the mess ───────────────────────
+// world.h records every destroyed tile (whoever destroyed it) and
+// this drains that list once a frame. One place decides what a
+// dying tree looks like, and the player, the drills, the bots, the
+// bullets and the mobs' teeth all get it for free.
+static void DrainWorldBreakEvents(void) {
+    for (int i = 0; i < worldBreakCount; i++) {
+        WorldBreakEvent *e = &worldBreaks[i];
+        Vector2 at = { (e->x + 0.5f) * TILE_SIZE, (e->y + 0.5f) * TILE_SIZE };
+        Color tint = TILES[e->type].color;
+        float radius = 15.0f;
+        float life = 0.42f;
+        if (e->type == TILE_TREE) {
+            // A felled tree throws leaves as well as splinters, and
+            // the burst is bigger — you should SEE a tree come down.
+            tint = (Color){ 52, 120, 58, 255 };
+            radius = 24.0f;
+            life = 0.70f;
+            AddEffectTinted(EFFECT_DEBRIS, at, 17.0f, 0.55f, (Color){ 96, 62, 34, 255 });
+        }
+        AddEffectTinted(EFFECT_DEBRIS, at, radius, life, tint);
+    }
+    worldBreakCount = 0;
 }
 
 static void AddBeam(Vector2 from, Vector2 to) {
@@ -396,28 +575,53 @@ static int MobCount(void) {
     return n;
 }
 
-static void SpawnMobAt(Vector2 pos) {
+static void SpawnMobKindAt(Vector2 pos, MobKind kind) {
     for (int i = 0; i < MAX_MOBS; i++) {
         if (!mobs[i].active) {
             float evo = EvolutionFactor();
+            const MobInfo *info = &MOBS_INFO[kind];
+            memset(&mobs[i], 0, sizeof(Mob));
             mobs[i].active = true;
+            mobs[i].kind = (unsigned char)kind;
             mobs[i].pos = pos;
             mobs[i].home = pos;
             mobs[i].target = pos;
-            mobs[i].maxHp = TUNE.mobHp * (1.0f + 2.0f * evo);  // 1x → 3x health
+            // 1x → 3x health over the evolution curve, times the
+            // species multiplier: a late broodmother is a wall.
+            mobs[i].maxHp = TUNE.mobHp * info->hp * (1.0f + 2.0f * evo);
             mobs[i].hp = mobs[i].maxHp;
             mobs[i].state = MOB_IDLE;
             mobs[i].retarget = 0;
+            mobs[i].chirp = (float)GetRandomValue(2, 14);
+            mobs[i].legPhase = (float)GetRandomValue(0, 628) / 100.0f;
             return;
         }
     }
+}
+
+// The old one-argument version: pick a species by the current
+// evolution and spawn that.
+static void SpawnMobAt(Vector2 pos) {
+    SpawnMobKindAt(pos, RollMobKind(EvolutionFactor()));
 }
 
 static void MobDamage(Mob *m, float dmg) {
     m->hp -= dmg;
     if (m->hp <= 0) {
         m->active = false;
+        const MobInfo *info = &MOBS_INFO[m->kind];
+        AddEffectTinted(EFFECT_DEBRIS, m->pos, 15.0f, 0.4f, info->body);
         AddEffect(EFFECT_RING, m->pos, 16, 0.25f);
+        SfxPlayAt(SFX_MOB_DIE, m->pos, worldListener, 0.5f);
+        // They drop what they're made of — and whatever they stole.
+        int n = GetRandomValue(info->dropMin, info->dropMax);
+        if (info->drops != ITEM_NONE && n > 0) DropItemAt(m->pos, info->drops, n);
+        if (GetRandomValue(1, 100) <= (m->kind == MOB_BROODMOTHER ? 100 : 8))
+            DropItemAt(m->pos, ITEM_GEM, 1);
+        if (m->loot != ITEM_NONE && m->lootN > 0) {
+            DropItemAt(m->pos, m->loot, m->lootN);      // your stuff, back
+            m->loot = ITEM_NONE; m->lootN = 0;
+        }
     } else {
         AddEffect(EFFECT_SPARK, m->pos, 7, 0.12f);   // hit feedback
     }
@@ -600,45 +804,81 @@ static void UpdateBombs(float dt, Player *p) {
 // ─── Mob AI ───────────────────────────────────────────────
 // Two states. IDLE: loiter near home, but aggro if the player gets
 // close. RAID: march on the player; anything in the way gets chewed.
+// One mob spotting you is now everyone's business: it shrieks, and
+// every native within earshot drops what it was doing and converges.
+// This is what turns "a mob" into "a swarm" — and what makes walking
+// into the waste without a gun a death sentence.
+static void MobCallForHelp(Vector2 at, float radius) {
+    for (int i = 0; i < MAX_MOBS; i++) {
+        if (!mobs[i].active || mobs[i].state == MOB_RAID) continue;
+        if (Vector2Distance(mobs[i].pos, at) > radius) continue;
+        mobs[i].state = MOB_RAID;
+        mobs[i].retarget = 0;
+    }
+}
+
 static void UpdateMobs(float dt, Player *p) {
     float evo = EvolutionFactor();
-    float speed = TUNE.mobSpeed * (1.0f + 0.5f * evo);
+    float baseSpeed = TUNE.mobSpeed * (1.0f + 0.5f * evo);
 
     for (int i = 0; i < MAX_MOBS; i++) {
         Mob *m = &mobs[i];
         if (!m->active) continue;
+        const MobInfo *info = &MOBS_INFO[m->kind];
 
         m->retarget -= dt;
         if (m->rage > 0) m->rage -= dt;
+        m->legPhase += dt * (info->speed * 7.0f);
+
+        // Idle chatter. You hear them before you see them, which is
+        // the only warning you get out in the dark.
+        m->chirp -= dt;
+        if (m->chirp <= 0) {
+            m->chirp = (float)GetRandomValue(4, 16);
+            if (Vector2Distance(m->pos, p->pos) < 620.0f)
+                SfxPlayAt(SFX_MOB_CHIRP, m->pos, worldListener, 0.30f);
+        }
 
         if (m->state == MOB_IDLE) {
             // Nest guards get more alert as evolution rises: early
             // game you can skirt a patch; late game they notice you
-            // from three times as far. Standing ON their home ground
-            // (near the nest they spawned from) sets them off no
-            // matter how young the world is.
-            float aggroRange = 70.0f + 190.0f * evo;
+            // from three times as far. The spiders are hunters — they
+            // see you from much farther out than the crawlers do.
+            float aggroRange = (70.0f + 190.0f * evo) * (info->legs > 0 ? 2.2f : 1.0f);
             if (Vector2Distance(p->pos, m->home) < 190.0f) {
                 m->state = MOB_RAID;                 // you're in their yard
                 m->retarget = 0;
                 m->rage = 8.0f;
+                MobCallForHelp(m->pos, 420.0f);
             } else if (Vector2Distance(m->pos, p->pos) < aggroRange) {
-                m->state = MOB_RAID;              // you woke the nest guard
+                m->state = MOB_RAID;              // spotted you
+                MobCallForHelp(m->pos, 380.0f);   // ...and told everyone
+                SfxPlayAt(SFX_MOB_CHIRP, m->pos, worldListener, 0.5f);
             } else if (m->retarget <= 0) {
-                m->target = (Vector2){ m->home.x + GetRandomValue(-90, 90),
-                                       m->home.y + GetRandomValue(-90, 90) };
-                m->retarget = (float)GetRandomValue(3, 6);
+                // Wander — and the spiders wander FAR. Their roam
+                // radius is measured in map-widths, not tiles, which
+                // is why you meet them a long way from any nest.
+                float roam = info->roam;
+                m->target = (Vector2){ m->home.x + GetRandomValue(-(int)roam, (int)roam),
+                                       m->home.y + GetRandomValue(-(int)roam, (int)roam) };
+                float span = worldSize * (float)TILE_SIZE;
+                m->target.x = Clamp(m->target.x, 8.0f, span - 8.0f);
+                m->target.y = Clamp(m->target.y, 8.0f, span - 8.0f);
+                m->retarget = (float)GetRandomValue(3, 9);
             }
         }
         if (m->state == MOB_RAID && m->retarget <= 0) {
             m->target = p->pos;                   // re-acquire the player
             m->retarget = 1.5f;
+            // Keep the pack together: a raider re-acquiring you drags
+            // its neighbours along, so they arrive as a wall.
+            MobCallForHelp(m->pos, 260.0f);
         }
 
         // Move axis-by-axis (same trick as PlayerMove) so mobs slide
         // along walls instead of sticking to them. Enraged mobs move
         // noticeably faster — you can see the swarm accelerate.
-        float moveSpeed = speed * (m->rage > 0 ? 1.45f : 1.0f);
+        float moveSpeed = baseSpeed * info->speed * (m->rage > 0 ? 1.45f : 1.0f);
         Vector2 d = Vector2Subtract(m->target, m->pos);
         if (Vector2Length(d) > 6.0f) {
             Vector2 dir = Vector2Normalize(d);
@@ -650,23 +890,36 @@ static void UpdateMobs(float dt, Player *p) {
 
             // Fully blocked while raiding? CHEW. Find the tile in the
             // way and gnaw it down — walls are food, doors are food,
-            // your turrets are food.
+            // your turrets are food. And when a container comes apart
+            // they STEAL: one stack goes home in the mob's jaws, the
+            // rest ends up scattered across the floor.
             if (!movedX && !movedY && m->state == MOB_RAID) {
                 int tx = (int)((m->pos.x + dir.x * TILE_SIZE * 0.8f) / TILE_SIZE);
                 int ty = (int)((m->pos.y + dir.y * TILE_SIZE * 0.8f) / TILE_SIZE);
-                if (tx >= 0 && tx < WORLD_SIZE && ty >= 0 && ty < WORLD_SIZE &&
-                    TILES[world[tx][ty].type].breakable) {
-                    float chew = TUNE.mobChewDPS * (1.0f + 1.0f * evo);
+                if (WorldInBounds(tx, ty) && TILES[world[tx][ty].type].breakable) {
+                    float chew = TUNE.mobChewDPS * info->damage * (1.0f + 1.0f * evo);
                     if (WorldDamageTile(tx, ty, chew * dt)) {
-                        RemoveMachineAt(tx, ty, NULL);   // eaten, not salvaged
+                        Machine *victim = MachineAt(tx, ty);
+                        if (victim != NULL && m->loot == ITEM_NONE) {
+                            for (int s = 0; s < MachineSlotCount(victim); s++) {
+                                if (victim->slots[s] == ITEM_NONE || victim->counts[s] <= 0) continue;
+                                m->loot  = victim->slots[s];
+                                m->lootN = victim->counts[s];
+                                victim->slots[s] = ITEM_NONE;
+                                victim->counts[s] = 0;
+                                break;
+                            }
+                        }
+                        RemoveMachineAt(tx, ty, NULL);   // the rest spills out
                     }
                 }
             }
         }
 
-        // Contact damage.
-        if (Vector2Distance(m->pos, p->pos) < PLAYER_RADIUS + 10.0f) {
-            PlayerDamage(p, TUNE.mobContactDPS * (1.0f + evo) * dt);
+        // Contact damage, per species. A broodmother hits nearly
+        // three times as hard as a crawler.
+        if (Vector2Distance(m->pos, p->pos) < PLAYER_RADIUS + info->size + 3.0f) {
+            PlayerDamage(p, TUNE.mobContactDPS * info->damage * (1.0f + evo) * dt);
         }
     }
 
@@ -744,6 +997,47 @@ static void UpdateSpawnersAndRaids(float dt, Player *p) {
     }
 }
 
+// ─── Wear: nothing runs forever ───────────────────────────
+// A machine counts the seconds it spends WORKING — idle time is
+// free, which is why a drill with no coal ages not at all. Past its
+// rated service life (TileServiceLife, in gamedata.h) it starts to
+// come apart on an ASYMPTOTIC curve: for a long while there's barely
+// any damage, and then the damage per second climbs as the square-ish
+// power of how far past due it is, so the last few percent of its
+// life happen very fast.
+//
+// The intended experience is exactly the one you get with a real
+// compressor: you never think about it, you don't know it can fail,
+// and then one day the line is stopped and something is smoking.
+// Returns false if the machine died this tick (the caller must stop
+// touching it — its record is gone).
+static bool MachineWearTick(Machine *m, float dt, bool working) {
+    float life = TileServiceLife(m->type) * TUNE.machineWearScale;
+    if (life <= 0) return true;                 // this kind never wears out
+    if (working) m->workHours += dt;
+    if (m->workHours <= life) return true;      // still within its rated life
+
+    float over = (m->workHours - life) / life;  // 0 at rated life, 1 at double
+    float dmg = MACHINE_DECAY_RATE * powf(over, MACHINE_DECAY_POWER);
+    Vector2 at = { (m->x + 0.5f) * TILE_SIZE, (m->y + 0.5f) * TILE_SIZE };
+    if (WorldDamageTile(m->x, m->y, dmg * dt)) {
+        SfxPlayAt(SFX_MACHINE_FAIL, at, worldListener, 0.85f);
+        AddEffectTinted(EFFECT_DEBRIS, at, 20.0f, 0.6f, (Color){ 90, 90, 96, 255 });
+        RemoveMachineAt(m->x, m->y, NULL);      // whatever was inside spills out
+        return false;
+    }
+    return true;
+}
+
+// How worn is it, 0..1? (1 = at its rated life; beyond that it's
+// living on borrowed time.) The machine panel draws this.
+static float MachineWearFrac(const Machine *m) {
+    float life = TileServiceLife(m->type) * TUNE.machineWearScale;
+    if (life <= 0) return 0;
+    float f = m->workHours / life;
+    return (f > 1.0f) ? 1.0f : f;
+}
+
 // ─── Machines: drills, belts, hands, turrets ──────────────
 static void UpdateMachines(float dt, Player *p) {
     (void)p;
@@ -751,6 +1045,15 @@ static void UpdateMachines(float dt, Player *p) {
         Machine *m = &machines[i];
         if (!m->active) continue;
         Vector2 center = { (m->x + 0.5f) * TILE_SIZE, (m->y + 0.5f) * TILE_SIZE };
+
+        // Age it first. "Working" means burning fuel, carrying cargo,
+        // or standing ready to shoot — an idle machine doesn't age.
+        bool working = false;
+        if (TileNeedsFuel(m->type))      working = (m->fuel > 0 || m->coal > 0);
+        else if (TileIsBelt(m->type))    working = (m->slots[0] != ITEM_NONE);
+        else if (m->type == TILE_TURRET) working = (m->ammo > 0);
+        else if (m->type == TILE_LASER_TURRET) working = true;
+        if (!MachineWearTick(m, dt, working)) continue;   // it just died
 
         switch (m->type) {
 
@@ -848,22 +1151,53 @@ static void UpdateMachines(float dt, Player *p) {
 
         case TILE_INSERTER: {
             // The robotic hand: grab ONE item from the tile BEHIND,
-            // drop it on the tile IN FRONT. Holds the item (slot 0)
-            // until the destination has room. Runs on coal.
-            if (!MachineConsumeFuel(m, dt)) break;   // out of coal → arm stops
+            // set it down on the tile IN FRONT. Holds the item (slot
+            // 0) until the destination has room. Runs on coal — and
+            // keeps ITSELF fed, so a line doesn't quietly die the
+            // moment one arm burns its last lump.
+            int bx = m->x - DIR_DX[m->dir], by = m->y - DIR_DY[m->dir];   // source
+            int fx = m->x + DIR_DX[m->dir], fy = m->y + DIR_DY[m->dir];   // dest
+            Machine *src  = MachineAt(bx, by);
+            Machine *dest = MachineAt(fx, fy);
+
+            // AUTO-FUELING. A dry arm spends its swing looking for
+            // coal instead: in the tile behind it, in its four
+            // neighbours, or in a pile on the floor. Rate-limited by
+            // the same timer, so a starving arm doesn't scan every
+            // frame — it just tries once per swing, forever, and
+            // wakes itself up the moment coal comes past.
+            if (m->coal <= 0 && m->fuel <= 0) {
+                m->timer -= dt;
+                if (m->timer > 0) break;
+                m->timer = TUNE.inserterInterval;
+                if (!InserterSelfFuel(m)) break;      // still dry → keep sleeping
+            }
+            if (!MachineConsumeFuel(m, dt)) break;    // out of coal → arm stops
+
             m->timer -= dt;
             if (m->timer > 0) break;
             m->timer = TUNE.inserterInterval;
+
             if (m->slots[0] == ITEM_NONE) {   // hand empty → try to grab
-                Machine *src = MachineAt(m->x - DIR_DX[m->dir], m->y - DIR_DY[m->dir]);
-                if (src != NULL && (src->type == TILE_CHEST || src->type == TILE_DRILL ||
-                                    TileIsBelt(src->type))) {
-                    ItemID got = MachineTakeItem(src);
+                // A fuel burner in front only ever accepts COAL, so
+                // the arm goes looking for coal specifically. Grabbing
+                // the first thing it touched is what used to leave
+                // arms stood there holding an ore plate forever.
+                bool feeding = (dest != NULL && TileNeedsFuel(dest->type));
+                if (!feeding || dest->coal < MACHINE_FUEL_MAX) {
+                    ItemID want = feeding ? ITEM_COAL : ITEM_NONE;
+                    ItemID got = ITEM_NONE;
+                    if (src != NULL && (src->type == TILE_CHEST || src->type == TILE_DRILL ||
+                                        TileIsBelt(src->type))) {
+                        got = feeding ? MachineTakeSpecific(src, ITEM_COAL)
+                                      : MachineTakeItem(src);
+                    }
+                    // Nothing behind it? Pick the floor up instead.
+                    if (got == ITEM_NONE) got = GroundTakeOneAt(bx, by, want);
                     if (got != ITEM_NONE) { m->slots[0] = got; m->counts[0] = 1; }
                 }
             }
             if (m->slots[0] != ITEM_NONE) {   // hand full → try to place
-                Machine *dest = MachineAt(m->x + DIR_DX[m->dir], m->y + DIR_DY[m->dir]);
                 ItemID id = m->slots[0];
                 bool placed = false;
                 if (dest != NULL) {
@@ -884,6 +1218,15 @@ static void UpdateMachines(float dt, Player *p) {
                     else if (TileNeedsFuel(dest->type) && id == ITEM_COAL) {
                         placed = MachineAddCoal(dest);   // arms can refuel arms
                     }
+                } else if (GroundTileFree(fx, fy)) {
+                    // Nothing in front to hand it to → set it on the
+                    // floor, exactly like an arm unloading onto the
+                    // ground in Factorio. A machine that REFUSES the
+                    // item is different: then the arm keeps holding,
+                    // so a mis-aimed arm can't quietly empty a chest
+                    // onto the dirt.
+                    placed = DropItemAt((Vector2){ (fx + 0.5f) * TILE_SIZE,
+                                                   (fy + 0.5f) * TILE_SIZE }, id, 1);
                 }
                 if (placed) { m->slots[0] = ITEM_NONE; m->counts[0] = 0; }
             }
@@ -1095,10 +1438,14 @@ static Vector2 BeltCarry(Vector2 pos, float dt) {
                       DIR_DY[m->dir] * BELT_CARRY_SPEED * dt };
 }
 
-// ─── F: scoop items off belts ─────────────────────────────
+// ─── F: scoop items off belts AND off the floor ───────────
 // Hold F to pull cargo off any belt within reach — the manual
-// override for when you want something back off the line.
+// override for when you want something back off the line. It sweeps
+// loose piles off the ground in the same gesture, so F is simply
+// "gather everything near me".
 static void BeltPickupNear(Player *p, float radiusPx) {
+    GroundPickupNear(p, p->pos, radiusPx, 0.25f);
+
     int cx = (int)(p->pos.x / TILE_SIZE), cy = (int)(p->pos.y / TILE_SIZE);
     int r = (int)(radiusPx / TILE_SIZE) + 1;
     for (int x = cx - r; x <= cx + r; x++) {
@@ -1138,16 +1485,29 @@ static void EntitiesReconcile(void) {
     }
 }
 
+// ─── Loose items ──────────────────────────────────────────
+// They just sit there and age; the age is what stops a stack you
+// dropped a frame ago from jumping back into your pockets. Walk
+// close enough and it's yours (hold F to reach farther).
+static void UpdateGroundItems(float dt, Player *p) {
+    for (int i = 0; i < MAX_GROUND_ITEMS; i++) {
+        if (groundItems[i].active) groundItems[i].age += dt;
+    }
+    GroundPickupNear(p, p->pos, GROUND_PICKUP_DIST, GROUND_PICKUP_DELAY);
+}
+
 // One call from main.c per gameplay frame.
 static void EntitiesUpdate(float dt, Player *p) {
     entGameTime += dt;
     EntitiesReconcile();
+    DrainWorldBreakEvents();   // debris for anything destroyed last frame
     UpdateSpawnersAndRaids(dt, p);
     UpdateMachines(dt, p);
     UpdateMobs(dt, p);
     UpdateBots(dt, p);
     UpdateProjectiles(dt, p);
     UpdateBombs(dt, p);
+    UpdateGroundItems(dt, p);
     UpdateEffects(dt);
     // Shake decays fast — a thump, not an earthquake.
     entShake -= entShake * 9.0f * dt;
@@ -1242,11 +1602,12 @@ static void EntitiesDrawWorld(Vector2 viewTopLeft, Vector2 viewBottomRight) {
             if (m == NULL) continue;
 
             if (t == TILE_INSERTER) {
-                // ── Animated linkage arm ───────────────────────
-                // A base motor, an elbow motor, and a claw. The arm
-                // swings from the pickup side (behind) to the drop
-                // side (front) as its timer runs, so you can watch
-                // it actually carry the item across.
+                // ── Animated swing arm ─────────────────────────
+                // A square motor housing, a jointed boom, and a
+                // two-finger GRIPPER — machinery, not a stick with a
+                // knob on the end. The boom swings from the pickup
+                // side (behind) to the drop side (front) as its timer
+                // runs, so you can watch it carry the item across.
                 float swing;                       // -1 = behind, +1 = front
                 float phase = 1.0f - (m->timer / TUNE.inserterInterval);
                 if (phase < 0) phase = 0;
@@ -1256,26 +1617,43 @@ static void EntitiesDrawWorld(Vector2 viewTopLeft, Vector2 viewBottomRight) {
                 swing = carrying ? (-1.0f + 2.0f * phase) : (1.0f - 2.0f * phase);
 
                 float dxf = (float)DIR_DX[dir], dyf = (float)DIR_DY[dir];
+                float sxf = -dyf, syf = dxf;      // "sideways" for this facing
                 Vector2 baseP = center;
                 float reach = TILE_SIZE * 0.62f;
-                Vector2 clawP = { center.x + dxf * reach * swing,
+                Vector2 gripP = { center.x + dxf * reach * swing,
                                   center.y + dyf * reach * swing };
-                // Elbow is lifted perpendicular so the arm reads as a
-                // linkage, not a stick.
-                Vector2 elbow = { (baseP.x + clawP.x) * 0.5f - dyf * 6.0f,
-                                  (baseP.y + clawP.y) * 0.5f + dxf * 6.0f };
+                // The elbow rides off to one side so the boom reads as
+                // a two-bar linkage folding and unfolding.
+                Vector2 elbow = { (baseP.x + gripP.x) * 0.5f + sxf * 6.0f,
+                                  (baseP.y + gripP.y) * 0.5f + syf * 6.0f };
 
+                // Motor housing: a squat plate bolted to the tile.
+                DrawRectanglePro((Rectangle){ baseP.x, baseP.y, 13, 9 },
+                                 (Vector2){ 6.5f, 4.5f },
+                                 atan2f(dyf, dxf) * RAD2DEG,
+                                 (Color){ 96, 96, 104, 255 });
+                DrawCircleV(baseP, 3.0f, (Color){ 58, 58, 64, 255 });
+
+                // Boom: two straight bars with a pin joint between.
                 DrawLineEx(baseP, elbow, 3.0f, (Color){ 190, 175, 90, 255 });
-                DrawLineEx(elbow, clawP, 3.0f, (Color){ 190, 175, 90, 255 });
-                // Motors: circles at base and elbow.
-                DrawCircleV(baseP, 5.0f, (Color){ 120, 120, 130, 255 });
-                DrawCircleV(baseP, 2.5f, (Color){ 60, 60, 66, 255 });
-                DrawCircleV(elbow, 3.5f, (Color){ 150, 150, 160, 255 });
-                // Claw
-                DrawCircleV(clawP, 4.0f, (Color){ 210, 190, 100, 255 });
-                DrawCircleLinesV(clawP, 4.0f, (Color){ 50, 45, 25, 255 });
+                DrawLineEx(elbow, gripP, 3.0f, (Color){ 190, 175, 90, 255 });
+                DrawCircleV(elbow, 2.5f, (Color){ 150, 150, 160, 255 });
+
+                // Gripper: two short fingers set across the boom,
+                // open when empty and closed around the cargo.
+                float spread = carrying ? 2.6f : 4.6f;
+                Vector2 wrist = { gripP.x - dxf * 2.5f, gripP.y - dyf * 2.5f };
+                for (int side = -1; side <= 1; side += 2) {
+                    Vector2 root = { wrist.x + sxf * spread * side,
+                                     wrist.y + syf * spread * side };
+                    Vector2 tip  = { root.x + dxf * 4.5f, root.y + dyf * 4.5f };
+                    DrawLineEx(root, tip, 2.0f, (Color){ 214, 196, 104, 255 });
+                }
+                DrawLineEx((Vector2){ wrist.x + sxf * spread, wrist.y + syf * spread },
+                           (Vector2){ wrist.x - sxf * spread, wrist.y - syf * spread },
+                           2.0f, (Color){ 150, 150, 160, 255 });
                 if (carrying) {
-                    DrawItemSprite(m->slots[0], clawP.x - 6, clawP.y - 6, 12);
+                    DrawItemSprite(m->slots[0], gripP.x - 6, gripP.y - 6, 12);
                 }
             }
 
@@ -1330,25 +1708,84 @@ static void EntitiesDrawWorld(Vector2 viewTopLeft, Vector2 viewBottomRight) {
         }
     }
 
-    // Mobs: blobby circles that get bigger and angrier with evolution.
+    // Loose items on the floor: the sprite, a soft shadow, and a
+    // count when the pile has grown. Drawn under everything that
+    // moves, because that's where they are — on the dirt.
+    for (int i = 0; i < MAX_GROUND_ITEMS; i++) {
+        GroundItem *g = &groundItems[i];
+        if (!g->active || g->count <= 0) continue;
+        if (g->pos.x < viewTopLeft.x - TILE_SIZE || g->pos.x > viewBottomRight.x + TILE_SIZE ||
+            g->pos.y < viewTopLeft.y - TILE_SIZE || g->pos.y > viewBottomRight.y + TILE_SIZE)
+            continue;
+        DrawEllipse((int)(g->pos.x + worldShadowVec.x * 0.35f),
+                    (int)(g->pos.y + worldShadowVec.y * 0.35f + 4),
+                    6.0f, 3.0f, WORLD_SHADOW_COLOR);
+        DrawItemSprite(g->id, g->pos.x - 7, g->pos.y - 7, 14);
+        if (g->count > 1) {
+            DrawText(TextFormat("%d", g->count), (int)(g->pos.x + 5),
+                     (int)(g->pos.y + 1), 10, RAYWHITE);
+        }
+    }
+
+    // The natives. Crawlers are blobs; the three spider species get
+    // jointed legs that scuttle in time with their movement, so you
+    // can tell at a glance what is coming at you and how fast.
     float evo = EvolutionFactor();
-    float mobR = 6.5f + 3.0f * evo;
     for (int i = 0; i < MAX_MOBS; i++) {
         if (!mobs[i].active) continue;
+        const MobInfo *info = &MOBS_INFO[mobs[i].kind];
         Vector2 mp = mobs[i].pos;
-        Color body = (mobs[i].rage > 0) ? (Color){ 255, 90, 40, 255 }
-                   : (mobs[i].state == MOB_RAID) ? (Color){ 210, 60, 50, 255 }
-                                                 : (Color){ 160, 60, 130, 255 };
+        float mobR = info->size * (1.0f + 0.35f * evo);
+        Color body = info->body;
+        if (mobs[i].state == MOB_RAID) body = ItemArtShade(body, 1.25f);
         if (mobs[i].rage > 0) {   // enraged: a hot halo you can read at a glance
-            DrawCircleLinesV(mobs[i].pos, mobR + 3.0f, (Color){ 255, 140, 40, 190 });
+            body = (Color){ 255, 90, 40, 255 };
+            DrawCircleLinesV(mp, mobR + 3.0f, (Color){ 255, 140, 40, 190 });
         }
         DrawEllipse((int)(mp.x + worldShadowVec.x * 0.5f),
                     (int)(mp.y + worldShadowVec.y * 0.5f),
                     mobR * 1.05f, mobR * 0.8f, WORLD_SHADOW_COLOR);
+
+        // Legs first, so the body sits on top of them.
+        if (info->legs > 0) {
+            Color legC = ItemArtShade(body, 0.62f);
+            for (int leg = 0; leg < info->legs; leg++) {
+                float side = (leg < info->legs / 2) ? -1.0f : 1.0f;
+                float slot = (float)(leg % (info->legs / 2));
+                float ang = (-0.75f + 0.5f * slot) * PI * 0.62f;   // fan them out
+                // Each leg lifts and falls out of phase with the next.
+                float step = sinf(mobs[i].legPhase + leg * 1.4f) * 0.30f;
+                float len  = mobR * (1.75f + 0.28f * sinf(mobs[i].legPhase * 1.3f + leg));
+                Vector2 knee = { mp.x + cosf(ang + step) * len * 0.55f * side,
+                                 mp.y + sinf(ang + step) * len * 0.55f };
+                Vector2 foot = { mp.x + cosf(ang + step * 1.6f) * len * side,
+                                 mp.y + sinf(ang + step * 1.6f) * len + mobR * 0.35f };
+                DrawLineEx(mp, knee, 2.0f, legC);
+                DrawLineEx(knee, foot, 1.6f, legC);
+            }
+        }
+
         DrawCircleV(mp, mobR, body);
         DrawCircleLinesV(mp, mobR + 1, (Color){ 20, 10, 20, 255 });
-        DrawCircle((int)(mp.x - 2), (int)(mp.y - 2), 1.5f, RAYWHITE);   // eyes
-        DrawCircle((int)(mp.x + 2), (int)(mp.y - 2), 1.5f, RAYWHITE);
+        if (info->legs > 0) {
+            // A spider's front half: a smaller cephalothorax with a
+            // cluster of little eyes.
+            Vector2 head = { mp.x, mp.y - mobR * 0.72f };
+            DrawCircleV(head, mobR * 0.55f, ItemArtShade(body, 0.8f));
+            for (int e = -1; e <= 1; e += 2) {
+                DrawCircle((int)(head.x + e * mobR * 0.22f), (int)(head.y - mobR * 0.1f),
+                           mobR * 0.13f, RAYWHITE);
+                DrawCircle((int)(head.x + e * mobR * 0.38f), (int)(head.y + mobR * 0.12f),
+                           mobR * 0.09f, (Color){ 255, 220, 220, 220 });
+            }
+        } else {
+            DrawCircle((int)(mp.x - 2), (int)(mp.y - 2), 1.5f, RAYWHITE);   // eyes
+            DrawCircle((int)(mp.x + 2), (int)(mp.y - 2), 1.5f, RAYWHITE);
+        }
+        // Carrying something it tore out of your base? Show it.
+        if (mobs[i].loot != ITEM_NONE && mobs[i].lootN > 0) {
+            DrawItemSprite(mobs[i].loot, mp.x - 5, mp.y - mobR - 13, 10);
+        }
         if (mobs[i].hp < mobs[i].maxHp) {
             float w = 14.0f * (mobs[i].hp / mobs[i].maxHp);
             DrawRectangle((int)(mp.x - 7), (int)(mp.y - mobR - 5), (int)w, 2, RED);
@@ -1413,6 +1850,24 @@ static void EntitiesDrawWorld(Vector2 viewTopLeft, Vector2 viewBottomRight) {
             float r = effects[i].maxRadius * (1.0f - k * 0.5f);
             DrawCircleV(effects[i].pos, r, (Color){ 255, 240, 180, a });
             DrawCircleV(effects[i].pos, r * 0.5f, (Color){ 255, 255, 255, a });
+        } else if (effects[i].kind == EFFECT_DEBRIS) {
+            // Chunks thrown outward and falling: eight little squares
+            // on fixed radial paths, sinking as they go. This is what
+            // a tree coming down or a machine giving up looks like.
+            unsigned int seed = effects[i].seed;
+            for (int chunk = 0; chunk < 8; chunk++) {
+                seed = seed * 1664525u + 1013904223u;
+                float ang = (seed % 628) / 100.0f;
+                float speed = 0.5f + ((seed >> 9) % 100) / 100.0f;
+                float dist = effects[i].maxRadius * speed * k;
+                float size = 2.0f + ((seed >> 17) % 3);
+                float fall = 14.0f * k * k;             // gravity, roughly
+                Color c = effects[i].tint;
+                c.a = a;
+                DrawRectangle((int)(effects[i].pos.x + cosf(ang) * dist),
+                              (int)(effects[i].pos.y + sinf(ang) * dist + fall),
+                              (int)size, (int)size, c);
+            }
         } else {   // EFFECT_SPARK — a puff of hit-confirm
             float r = effects[i].maxRadius * (0.4f + 0.6f * k);
             DrawCircleLinesV(effects[i].pos, r, (Color){ 255, 220, 140, a });
@@ -1428,13 +1883,15 @@ static void EntitiesDrawMinimap(const Player *p) {
 
     DrawRectangle(mx - 3, my - 3, size + 6, size + 6, (Color){ 10, 10, 18, 220 });
     DrawTexturePro(worldMinimapTex,
-                   (Rectangle){ 0, 0, (float)WORLD_SIZE, (float)WORLD_SIZE },
+                   // Only the ACTIVE map: a shrunk world fills the
+                   // minimap instead of hiding in one corner of it.
+                   (Rectangle){ 0, 0, (float)worldSize, (float)worldSize },
                    (Rectangle){ (float)mx, (float)my, (float)size, (float)size },
                    (Vector2){ 0, 0 }, 0, WHITE);
     DrawRectangleLines(mx - 3, my - 3, size + 6, size + 6, SKYBLUE);
 
     // Pips respect the fog: a mob you've never scouted stays hidden.
-    float scale = (float)size / (WORLD_SIZE * TILE_SIZE);
+    float scale = (float)size / (worldSize * TILE_SIZE);
     for (int i = 0; i < MAX_MOBS; i++) {          // mobs: red pips
         if (!mobs[i].active) continue;
         int tx = (int)(mobs[i].pos.x / TILE_SIZE), ty = (int)(mobs[i].pos.y / TILE_SIZE);
@@ -1468,12 +1925,14 @@ static void EntitiesDrawFullMap(const Player *p) {
 
     DrawRectangle(0, 0, sw, sh, (Color){ 4, 6, 10, 235 });
     DrawTexturePro(worldMinimapTex,
-                   (Rectangle){ 0, 0, (float)WORLD_SIZE, (float)WORLD_SIZE },
+                   // Only the ACTIVE map: a shrunk world fills the
+                   // minimap instead of hiding in one corner of it.
+                   (Rectangle){ 0, 0, (float)worldSize, (float)worldSize },
                    (Rectangle){ (float)mx, (float)my, (float)size, (float)size },
                    (Vector2){ 0, 0 }, 0, WHITE);
     DrawRectangleLines(mx - 2, my - 2, size + 4, size + 4, SKYBLUE);
 
-    float scale = (float)size / (WORLD_SIZE * TILE_SIZE);
+    float scale = (float)size / (worldSize * TILE_SIZE);
     for (int i = 0; i < MAX_MOBS; i++) {
         if (!mobs[i].active) continue;
         int tx = (int)(mobs[i].pos.x / TILE_SIZE), ty = (int)(mobs[i].pos.y / TILE_SIZE);
@@ -1506,6 +1965,9 @@ static bool EntitiesWrite(FILE *f) {
     if (fwrite(machines, sizeof(machines), 1, f) != 1) return false;
     if (fwrite(mobs,     sizeof(mobs),     1, f) != 1) return false;
     if (fwrite(bots,     sizeof(bots),     1, f) != 1) return false;
+    // Appended AFTER the old blocks on purpose: a save written before
+    // loose items existed simply ends here, and still loads.
+    if (fwrite(groundItems, sizeof(groundItems), 1, f) != 1) return false;
     return true;
 }
 
@@ -1514,6 +1976,12 @@ static bool EntitiesRead(FILE *f) {
     if (fread(machines, sizeof(machines), 1, f) != 1) return false;
     if (fread(mobs,     sizeof(mobs),     1, f) != 1) return false;
     if (fread(bots,     sizeof(bots),     1, f) != 1) return false;
+    // Loose items are OPTIONAL: an older save just stops after the
+    // bots, and a world with nothing on its floor is a perfectly good
+    // world. Failing the whole load over it would throw away a base.
+    if (fread(groundItems, sizeof(groundItems), 1, f) != 1) {
+        memset(groundItems, 0, sizeof(groundItems));
+    }
 
     // Untrusted data: clear the transient pools, rebuild the machine
     // index from what we loaded, clamp everything into the world.
@@ -1546,6 +2014,17 @@ static bool EntitiesRead(FILE *f) {
         bots[i].pos.y = Clamp(bots[i].pos.y, 0, worldMax);
         for (int d = 0; d < ITEM_COUNT; d++)
             if (bots[i].inv[d] < 0) bots[i].inv[d] = 0;
+    }
+    for (int i = 0; i < MAX_GROUND_ITEMS; i++) {
+        GroundItem *g = &groundItems[i];
+        if (!g->active) continue;
+        if (g->id <= ITEM_NONE || g->id >= ITEM_COUNT || g->count <= 0) {
+            g->active = false;                      // garbage entry → drop it
+            continue;
+        }
+        g->pos.x = Clamp(g->pos.x, 0, worldMax);
+        g->pos.y = Clamp(g->pos.y, 0, worldMax);
+        if (g->age < 0) g->age = 0;
     }
     if (entGameTime < 0) entGameTime = 0;
     entShake = 0;
