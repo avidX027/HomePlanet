@@ -15,6 +15,7 @@
 #include "gamedata.h"
 #include "player.h"
 #include "entities.h"   // Machine — the block panels read machine state
+#include "saves.h"      // SaveSlot — the saves screen draws the slot table
 
 typedef struct {
     Rectangle rect;
@@ -829,13 +830,16 @@ typedef struct {
     int gridX, gridY;
     int slotCount;
     bool hasFuel;
-    Rectangle fuelRect;   // the coal slot, when the machine burns it
+    Rectangle fuelRect;     // the coal slot, when the machine burns it
+    bool hasFilter;         // inserters and splitters sort by item
+    Rectangle filterRect;   // ...and this is the button that says which
 } MachinePanelLayout;
 
 static void UiGetMachinePanelLayout(const Player *p, const Machine *m,
                                     MachinePanelLayout *l) {
     l->slotCount = MachineSlotCount(m);
     l->hasFuel = TileNeedsFuel(m->type);
+    l->hasFilter = TileHasFilter(m->type);
     if (m->type == TILE_CHEST)      { l->cols = 7; l->rows = 7; }
     else if (m->type == TILE_DRILL) { l->cols = 4; l->rows = 2; }
     else                            { l->cols = 1; l->rows = 1; }
@@ -848,9 +852,10 @@ static void UiGetMachinePanelLayout(const Player *p, const Machine *m,
 
     int gridW = l->cols * l->slotSize + (l->cols - 1) * l->gap;
     int gridH = l->rows * l->slotSize + (l->rows - 1) * l->gap;
-    int fuelH = l->hasFuel ? 62 : 0;
+    int fuelH   = l->hasFuel   ? 62 : 0;
+    int filterH = l->hasFilter ? 66 : 0;
 
-    l->h = UI_HEADER_H + 16 + gridH + fuelH + 18;
+    l->h = UI_HEADER_H + 16 + gridH + fuelH + filterH + 18;
     // Third column of the dock, beside Character and Crafting.
     l->x = UiDockX(p, UI_PANEL_MACH, m);
     l->y = (GetScreenHeight() - l->h) / 2;
@@ -859,6 +864,63 @@ static void UiGetMachinePanelLayout(const Player *p, const Machine *m,
     l->gridY = l->y + UI_HEADER_H + 12;
     l->fuelRect = (Rectangle){ (float)(l->x + 16),
                                (float)(l->gridY + gridH + 22), 44, 44 };
+    // The filter sits under the fuel slot when there is one, so an
+    // inserter reads top to bottom as cargo, fuel, sorting rule.
+    l->filterRect = (Rectangle){ (float)(l->x + 16),
+                                 (float)(l->gridY + gridH + 26 + fuelH), 44, 44 };
+}
+
+// ─── The filter picker ────────────────────────────────────
+// Click a machine's filter slot and this drops over the screen: a
+// grid of EVERY item in the game — which, since anything can ride a
+// belt, is exactly the list of things worth sorting for. Click one
+// and it becomes the rule. The grid is built straight from the ITEMS
+// table, so an item added to gamedata.h appears here for free.
+#define UI_FILTER_COLS 8
+
+typedef struct {
+    int x, y, w, h;
+    int cols, rows;
+    int cell, gap;
+    int gridX, gridY;
+    int count;             // how many items are offered
+    Rectangle clearRect;   // the "ANY ITEM" button
+} FilterPickerLayout;
+
+// The `i`-th item on offer. Index 0 is ITEM_WOOD — slot 0 of the
+// enum is the "nothing" sentinel and isn't a thing you can filter for.
+static ItemID UiFilterItemAt(int i) {
+    ItemID id = (ItemID)(i + 1);
+    return (id > ITEM_NONE && id < ITEM_COUNT) ? id : ITEM_NONE;
+}
+
+static void UiGetFilterPickerLayout(FilterPickerLayout *l) {
+    l->count = ITEM_COUNT - 1;
+    l->cols  = UI_FILTER_COLS;
+    l->rows  = (l->count + l->cols - 1) / l->cols;
+    l->cell  = 46;
+    l->gap   = 6;
+
+    int gridW = l->cols * l->cell + (l->cols - 1) * l->gap;
+    int gridH = l->rows * l->cell + (l->rows - 1) * l->gap;
+    l->w = gridW + 32;
+    l->h = UI_HEADER_H + 14 + gridH + 46 + 14;
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+    if (l->w > sw - 16) l->w = sw - 16;
+    if (l->h > sh - 16) l->h = sh - 16;
+    l->x = (sw - l->w) / 2;
+    l->y = (sh - l->h) / 2;
+    l->gridX = l->x + (l->w - gridW) / 2;
+    l->gridY = l->y + UI_HEADER_H + 12;
+    l->clearRect = (Rectangle){ (float)(l->x + 16), (float)(l->y + l->h - 50),
+                                (float)(l->w - 32), 36 };
+}
+
+static Rectangle UiFilterCellRect(const FilterPickerLayout *l, int i) {
+    int c = i % l->cols, r = i / l->cols;
+    return (Rectangle){ (float)(l->gridX + c * (l->cell + l->gap)),
+                        (float)(l->gridY + r * (l->cell + l->gap)),
+                        (float)l->cell, (float)l->cell };
 }
 
 static Rectangle UiMachineSlotRect(const MachinePanelLayout *l, int idx) {
@@ -916,6 +978,266 @@ static void UiDrawMachinePanel(const Player *p) {
         DrawText(m->fuel > 0 ? "BURNING" : "NO FUEL", barX, barY + 20, 13,
                  m->fuel > 0 ? (Color){ 255, 190, 120, 255 } : (Color){ 230, 110, 110, 255 });
     }
+
+    if (l.hasFilter) {
+        // The filter slot: empty means "handle anything". Clicking it
+        // opens the item grid; right-clicking it clears the rule.
+        bool hovered = CheckCollisionPointRec(GetMousePosition(), l.filterRect);
+        bool set = (m->filter != ITEM_NONE);
+        DrawRectangleRec(l.filterRect, hovered ? UI_SLOT_HOVER : UI_SLOT_BG);
+        DrawRectangleLinesEx(l.filterRect, hovered ? 2 : 1,
+                             set ? UI_ACCENT : UI_SLOT_BORDER);
+        if (set) {
+            DrawItemSprite(m->filter, l.filterRect.x + 7, l.filterRect.y + 7, 30);
+        } else {
+            DrawText("ANY", (int)l.filterRect.x + 8, (int)l.filterRect.y + 15, 15,
+                     (Color){ 150, 150, 158, 255 });
+        }
+
+        int tx = (int)(l.filterRect.x + l.filterRect.width + 12);
+        int ty = (int)(l.filterRect.y + 4);
+        DrawText("FILTER", tx, ty, 14, UI_ACCENT);
+        // Two machines, two meanings — spell out which one this is.
+        const char *line = (m->type == TILE_SPLITTER)
+            ? (set ? "matches go LEFT" : "alternates L / R")
+            : (set ? "only picks this up" : "picks up anything");
+        DrawText(line, tx, ty + 18, 12, (Color){ 205, 210, 222, 255 });
+        DrawText(set ? "click: change   RMB: clear" : "click to choose an item",
+                 tx, ty + 33, 11, (Color){ 150, 156, 168, 255 });
+    }
+}
+
+// The item grid itself, drawn over everything else the panel row has.
+static void UiDrawFilterPicker(void) {
+    if (!machineFilterPickerOpen) return;
+    Machine *m = MachineAt(machineUiX, machineUiY);
+    if (m == NULL || !TileHasFilter(m->type)) return;
+
+    FilterPickerLayout l = { 0 };
+    UiGetFilterPickerLayout(&l);
+
+    // A dim behind it, because unlike the docked panels this one is
+    // MODAL: it wants the next click, whatever else is on screen.
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), (Color){ 4, 4, 8, 150 });
+    UiDrawPanelFrame(l.x, l.y, l.w, l.h, "SET FILTER");
+    UiDrawCloseButton(l.x, l.y, l.w);
+
+    Vector2 mouse = GetMousePosition();
+    for (int i = 0; i < l.count; i++) {
+        ItemID id = UiFilterItemAt(i);
+        if (id == ITEM_NONE) continue;
+        Rectangle r = UiFilterCellRect(&l, i);
+        if (r.y + r.height > l.clearRect.y - 6) break;   // ran out of panel
+        bool hovered = CheckCollisionPointRec(mouse, r);
+        bool chosen  = (m->filter == id);
+        DrawRectangleRec(r, hovered ? UI_SLOT_HOVER : UI_SLOT_BG);
+        DrawRectangleLinesEx(r, (hovered || chosen) ? 2 : 1,
+                             chosen ? UI_ACCENT : UI_SLOT_BORDER);
+        DrawItemSprite(id, r.x + 7, r.y + 5, 32);
+        // The name only appears under the cursor: 36 labels at once is
+        // an unreadable wall, one label is a tooltip.
+        if (hovered) {
+            const char *nm = ITEMS[id].name;
+            int nw = MeasureText(nm, 12);
+            int bx = (int)(r.x + r.width / 2) - nw / 2 - 4;
+            if (bx < l.x + 4) bx = l.x + 4;
+            if (bx + nw + 8 > l.x + l.w - 4) bx = l.x + l.w - 12 - nw;
+            DrawRectangle(bx, (int)r.y - 18, nw + 8, 16, (Color){ 16, 16, 22, 235 });
+            DrawText(nm, bx + 4, (int)r.y - 16, 12, RAYWHITE);
+        }
+    }
+
+    bool clearHov = CheckCollisionPointRec(mouse, l.clearRect);
+    bool none = (m->filter == ITEM_NONE);
+    DrawRectangleRec(l.clearRect, clearHov ? (Color){ 66, 66, 70, 255 } : UI_SLOT_BG);
+    DrawRectangleLinesEx(l.clearRect, 1, none ? UI_ACCENT : UI_SLOT_BORDER);
+    const char *label = "NO FILTER  (handle any item)";
+    DrawText(label, (int)(l.clearRect.x + l.clearRect.width / 2) - MeasureText(label, 15) / 2,
+             (int)l.clearRect.y + 10, 15, none ? UI_ACCENT : RAYWHITE);
+}
+
+// ─── The saves screen ─────────────────────────────────────
+// Eight worlds as a grid of CARDS. A card is a thumbnail with a name
+// you can type into and two lines of "which one is this?" — the date
+// it was written and how long it's been played. Empty slots are
+// drawn as empty slots rather than hidden, because "there is room
+// for another world here" is information too.
+//
+// Same shared-layout rule as every other panel: this file computes
+// the rectangles, main.c hit-tests the SAME rectangles, so a click
+// can never land somewhere other than where it looks.
+#define UI_SAVE_COLS 4
+#define UI_SAVE_ROWS ((SAVE_SLOTS + UI_SAVE_COLS - 1) / UI_SAVE_COLS)
+
+typedef struct {
+    int x, y, w, h;         // the framed panel
+    int cardW, cardH, gap;
+    int gridX, gridY;
+    int thumbH;             // height of the preview strip on a card
+} SavesLayout;
+
+static void UiGetSavesLayout(SavesLayout *l) {
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+    l->gap = 14;
+    l->cardW = 250;
+    l->cardH = 196;
+    // Shrink the cards rather than the grid when the window is small,
+    // so all eight worlds stay on one screen at any size.
+    int availW = sw - 60 - (UI_SAVE_COLS - 1) * l->gap;
+    if (l->cardW * UI_SAVE_COLS > availW) l->cardW = availW / UI_SAVE_COLS;
+    if (l->cardW < 130) l->cardW = 130;
+    int availH = sh - 190 - (UI_SAVE_ROWS - 1) * l->gap;
+    if (l->cardH * UI_SAVE_ROWS > availH) l->cardH = availH / UI_SAVE_ROWS;
+    if (l->cardH < 120) l->cardH = 120;
+    l->thumbH = l->cardH - 62;          // the rest is name + two info lines
+    if (l->thumbH < 40) l->thumbH = 40;
+
+    int gridW = UI_SAVE_COLS * l->cardW + (UI_SAVE_COLS - 1) * l->gap;
+    int gridH = UI_SAVE_ROWS * l->cardH + (UI_SAVE_ROWS - 1) * l->gap;
+    l->w = gridW + 32;
+    l->h = gridH + UI_HEADER_H + 34;
+    l->x = (sw - l->w) / 2;
+    l->y = (sh - l->h) / 2 - 20;
+    if (l->y < 8) l->y = 8;
+    l->gridX = l->x + 16;
+    l->gridY = l->y + UI_HEADER_H + 14;
+}
+
+static Rectangle UiSaveCardRect(const SavesLayout *l, int slot) {
+    int c = slot % UI_SAVE_COLS, r = slot / UI_SAVE_COLS;
+    return (Rectangle){ (float)(l->gridX + c * (l->cardW + l->gap)),
+                        (float)(l->gridY + r * (l->cardH + l->gap)),
+                        (float)l->cardW, (float)l->cardH };
+}
+
+// The name strip: click it to rename, rather than the card body,
+// which loads. Two targets on one card, and they never overlap.
+static Rectangle UiSaveNameRect(const SavesLayout *l, int slot) {
+    Rectangle c = UiSaveCardRect(l, slot);
+    return (Rectangle){ c.x + 4, c.y + l->thumbH + 4, c.width - 34, 21 };
+}
+
+// The little [x]. It takes TWO clicks to delete — see the confirm
+// state in main.c — because a world is hours of someone's evening.
+static Rectangle UiSaveDeleteRect(const SavesLayout *l, int slot) {
+    Rectangle c = UiSaveCardRect(l, slot);
+    return (Rectangle){ c.x + c.width - 27, c.y + l->thumbH + 4, 23, 21 };
+}
+
+// `renaming` is the slot currently being typed into (-1 = none) and
+// `nameBuf` is the live text; `confirmDelete` is the slot showing its
+// second-click warning. All three live in main.c — the UI draws the
+// state, it doesn't own it.
+static void UiDrawSavesScreen(int renaming, const char *nameBuf, int confirmDelete) {
+    SavesLayout l = { 0 };
+    UiGetSavesLayout(&l);
+    int sw = GetScreenWidth();
+
+    DrawRectangle(0, 0, sw, GetScreenHeight(), (Color){ 4, 6, 10, 225 });
+    UiDrawPanelFrame(l.x, l.y, l.w, l.h, "SAVED WORLDS");
+
+    Vector2 mouse = GetMousePosition();
+    for (int slot = 0; slot < SAVE_SLOTS; slot++) {
+        Rectangle card = UiSaveCardRect(&l, slot);
+        Rectangle name = UiSaveNameRect(&l, slot);
+        Rectangle del  = UiSaveDeleteRect(&l, slot);
+        const SaveSlot *s = &saveSlots[slot];
+        bool hovered  = CheckCollisionPointRec(mouse, card);
+        bool onName   = CheckCollisionPointRec(mouse, name);
+        bool onDelete = CheckCollisionPointRec(mouse, del);
+        bool editing  = (renaming == slot);
+        bool warning  = (confirmDelete == slot);
+
+        if (s->blocked) {
+            // A file we couldn't read. Deliberately does NOT look
+            // like an empty slot and doesn't respond to hover: the
+            // whole point is that clicking it must not feel available.
+            DrawRectangleRec(card, (Color){ 46, 38, 30, 255 });
+            DrawRectangleLinesEx(card, 1, (Color){ 128, 96, 52, 255 });
+            const char *a = "UNREADABLE SAVE";
+            const char *b = "written by a different version";
+            const char *c = "left alone, not overwritten";
+            DrawText(a, (int)(card.x + card.width / 2) - MeasureText(a, 15) / 2,
+                     (int)(card.y + card.height / 2) - 24, 15, (Color){ 232, 176, 96, 255 });
+            DrawText(b, (int)(card.x + card.width / 2) - MeasureText(b, 11) / 2,
+                     (int)(card.y + card.height / 2) - 2, 11, (Color){ 176, 152, 120, 255 });
+            DrawText(c, (int)(card.x + card.width / 2) - MeasureText(c, 11) / 2,
+                     (int)(card.y + card.height / 2) + 14, 11, (Color){ 148, 128, 102, 255 });
+            continue;
+        }
+        if (!s->used) {
+            // An empty berth, drawn faintly — a place a world could
+            // go, which is exactly what it is.
+            DrawRectangleRec(card, (Color){ 38, 38, 42, 255 });
+            DrawRectangleLinesEx(card, hovered ? 2 : 1,
+                                 hovered ? UI_ACCENT : (Color){ 74, 74, 80, 255 });
+            const char *a = "EMPTY SLOT";
+            const char *b = "click to start a world here";
+            DrawText(a, (int)(card.x + card.width / 2) - MeasureText(a, 16) / 2,
+                     (int)(card.y + card.height / 2) - 16, 16,
+                     hovered ? RAYWHITE : (Color){ 132, 132, 140, 255 });
+            DrawText(b, (int)(card.x + card.width / 2) - MeasureText(b, 11) / 2,
+                     (int)(card.y + card.height / 2) + 6, 11, (Color){ 118, 118, 126, 255 });
+            continue;
+        }
+
+        DrawRectangleRec(card, warning ? (Color){ 62, 26, 26, 255 } : UI_SLOT_BG);
+
+        // The thumbnail, letterboxed into the strip so a square
+        // preview never stretches into a rectangle.
+        Rectangle strip = { card.x + 4, card.y + 4, card.width - 8, (float)l.thumbH - 4 };
+        DrawRectangleRec(strip, (Color){ 12, 12, 18, 255 });
+        if (s->hasThumb) {
+            float side = (strip.width < strip.height) ? strip.width : strip.height;
+            Rectangle dst = { strip.x + (strip.width - side) / 2,
+                              strip.y + (strip.height - side) / 2, side, side };
+            DrawTexturePro(s->thumb,
+                           (Rectangle){ 0, 0, (float)SAVE_PREVIEW_DIM, (float)SAVE_PREVIEW_DIM },
+                           dst, (Vector2){ 0, 0 }, 0, WHITE);
+        }
+        DrawRectangleLinesEx(strip, 1, (Color){ 70, 70, 78, 255 });
+
+        // The name strip doubles as the text field.
+        DrawRectangleRec(name, editing ? (Color){ 24, 40, 60, 255 }
+                                       : (onName ? UI_SLOT_HOVER : (Color){ 34, 34, 38, 255 }));
+        DrawRectangleLinesEx(name, editing ? 2 : 1,
+                             editing ? UI_ACCENT : (onName ? UI_SLOT_BORDER
+                                                           : (Color){ 58, 58, 64, 255 }));
+        const char *label = editing ? nameBuf : s->head.name;
+        BeginScissorMode((int)name.x + 3, (int)name.y + 2, (int)name.width - 6, (int)name.height - 4);
+        DrawText(label, (int)name.x + 6, (int)name.y + 4, 15, RAYWHITE);
+        if (editing && ((int)(GetTime() * 2)) % 2 == 0) {
+            DrawText("_", (int)name.x + 8 + MeasureText(label, 15), (int)name.y + 4, 15, UI_ACCENT);
+        }
+        EndScissorMode();
+
+        DrawRectangleRec(del, onDelete ? (Color){ 170, 62, 62, 255 } : (Color){ 48, 48, 54, 255 });
+        DrawRectangleLinesEx(del, 1, onDelete ? RAYWHITE : (Color){ 76, 76, 84, 255 });
+        DrawText("x", (int)del.x + 8, (int)del.y + 3, 15, RAYWHITE);
+
+        if (warning) {
+            const char *w = "click x again to DELETE";
+            DrawText(w, (int)(card.x + card.width / 2) - MeasureText(w, 12) / 2,
+                     (int)(card.y + l.thumbH + 32), 12, (Color){ 255, 150, 150, 255 });
+        } else {
+            DrawText(SaveStampText(s->head.stamp), (int)card.x + 6,
+                     (int)(card.y + l.thumbH + 30), 12, (Color){ 196, 202, 214, 255 });
+            DrawText(SavePlayTimeText(s->head.playSeconds), (int)card.x + 6,
+                     (int)(card.y + l.thumbH + 46), 12, (Color){ 146, 152, 164, 255 });
+        }
+
+        // The card border is the hint: orange when this click loads it.
+        bool loadable = hovered && !onName && !onDelete;
+        DrawRectangleLinesEx(card, loadable ? 2 : 1,
+                             loadable ? UI_ACCENT : (Color){ 88, 88, 96, 255 });
+    }
+
+    // Plain ASCII: raylib's built-in font has no dashes or bullets.
+    const char *hint = (renaming >= 0)
+        ? "typing a name  |  ENTER to keep it, ESC to cancel"
+        : "click a world to play it  |  click its name to rename  |  x to delete";
+    DrawText(hint, sw / 2 - MeasureText(hint, 14) / 2, l.y + l.h + 12, 14,
+             (Color){ 150, 158, 172, 255 });
 }
 
 // ─── Health bar ───────────────────────────────────────────

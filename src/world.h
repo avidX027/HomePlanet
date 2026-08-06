@@ -189,6 +189,11 @@ static void WorldRevealAround(Vector2 posPx, int radiusTiles) {
     }
 }
 
+// Rolling cursor for the self-repair sweep (WorldHealTick, below).
+// Declared up here because WorldInit rewinds it, and C reads
+// top-to-bottom.
+static int worldHealCursor = 0;
+
 // ─── Generate a fresh world ───────────────────────────────
 // TECHNIQUE — Voronoi biomes: scatter random "seed points", each
 // carrying a biome; every tile takes the biome of its NEAREST seed.
@@ -530,7 +535,6 @@ static bool WorldDamageTile(int x, int y, float damage) {
 // per frame with a rolling cursor instead of touching all of it. The
 // heal amount is per SWEEP, not per second, which keeps the pace the
 // same however fast the machine runs.
-static int worldHealCursor = 0;
 static void WorldHealTick(void) {
     int tiles = TILE_HEAL_TILES_PER_FRAME;
     int total = worldSize * worldSize;
@@ -877,10 +881,12 @@ static void WorldMinimapRefresh(void) {
 
 // ─── Save file check ──────────────────────────────────────
 // (WorldSave/WorldLoad used to live here — the old world-only save
-// format. GameSave/GameLoad in main.c replaced them; GameLoad can
-// still READ old world-only files by recognizing their size.)
-static bool WorldHasSave(void) {
-    FILE *f = fopen(SAVE_FILE, "rb");
+// format. GameSave/GameLoad in main.c replaced them, and saves.h now
+// keeps eight of them in a slots directory. All that's left here is
+// "does this path open?", which is the one question about a save
+// file that needs nothing but stdio.)
+static bool WorldHasSaveFile(const char *path) {
+    FILE *f = fopen(path, "rb");
     if (f == NULL) return false;
     fclose(f);
     return true;

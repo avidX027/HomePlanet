@@ -115,6 +115,12 @@
 #define DRILL_BITE          4.0f        // damage per bite to the adjacent rock
 #define CONVEYOR_INTERVAL   0.35f       // seconds for an item to hop one belt
 #define INSERTER_INTERVAL   0.9f        // seconds per robotic-hand swing
+#define SPLITTER_INTERVAL   0.30f       // seconds per item leaving a splitter
+// Underground belts have no length limit — that's the whole point of
+// them — but a tunnel can never be longer than the map is wide, and
+// the placement tool refuses a run you can't pay for anyway.
+#define TUNNEL_MAX_LENGTH   WORLD_SIZE  // tiles, end to end (world-limited)
+#define TUNNEL_INTERVAL     0.35f       // seconds for cargo to cross the tunnel
 #define BOT_SPEED           100.0f      // mining bot flight speed
 #define BOT_DPS             5.0f        // mining bot dig speed
 #define BOMB_FUSE           2.5f
@@ -126,7 +132,11 @@
 #define PLAYER_OUTLINE  (Color){   0, 255, 255, 255 }   // ring around body
 
 // ─── Files ────────────────────────────────────────────────
-#define SAVE_FILE      "homeplanet.sav"
+// Saves live in their own directory as numbered slots now — see
+// SAVE_DIR and SAVE_SLOTS in saves.h. This is the OLD single-file
+// name, kept only so the one save written before slots existed is
+// still recognizable on disk; nothing reads or writes it.
+#define SAVE_FILE_LEGACY "homeplanet.sav"
 
 // ─── Live tuning (the F3 debug console) ───────────────────
 // The #defines above are the DEFAULTS. The game actually READS the

@@ -58,12 +58,30 @@ typedef struct {
     float    beltProgress;      // 0..1 slide of the item along a belt
     Vector2  beamTo;            // laser turrets: where the last zap went
     float    beamTtl;           // ...and how long to keep drawing it
+    // ── Sorting (inserters and splitters) ──
+    // ITEM_NONE = "no filter, handle anything". Otherwise an inserter
+    // only picks THIS item up, and a splitter routes it left while
+    // everything else goes right. Set from the item-grid picker.
+    ItemID   filter;
+    int      splitToggle;       // splitters: which side gets the next item
+    // ── Underground belts ──
+    // The two mouths of a tunnel each remember where the other one
+    // is. That single pair of coordinates is what makes the run's
+    // length irrelevant — cargo doesn't walk the gap, it's handed
+    // straight across.
+    int      linkX, linkY;      // partner mouth's tile (-1 = unlinked)
 } Machine;
 static Machine machines[MAX_MACHINES];
 
 // Which machine's UI panel is open? -1 = none. Lives here because
 // both main.c (input) and ui.h (drawing) need it.
 static int machineUiX = -1, machineUiY = -1;
+
+// Is the FILTER PICKER open on top of that panel? It's the grid of
+// every item in the game — click one and it becomes the machine's
+// filter. Same shared-state trick as machineUiX: main.c reads the
+// clicks, ui.h draws the grid.
+static bool machineFilterPickerOpen = false;
 
 // ─── Cross-panel drag ─────────────────────────────────────
 // One drag state shared by every slot surface (backpack, hotbar,
@@ -206,6 +224,7 @@ static void EntitiesReset(void) {
     entGameTime = 0;
     entShake    = 0;
     machineUiX  = machineUiY = -1;
+    machineFilterPickerOpen = false;
 }
 
 static Machine *MachineAt(int x, int y) {
@@ -236,6 +255,8 @@ static Machine *AddMachineAt(int x, int y, TileType type, int dir) {
     machines[slot].x = x;  machines[slot].y = y;
     machines[slot].type = type;
     machines[slot].dir = dir & 3;
+    machines[slot].filter = ITEM_NONE;
+    machines[slot].linkX = machines[slot].linkY = -1;   // 0,0 is a real tile
     machineIndex[x][y] = (short)slot;
     return &machines[slot];
 }
@@ -275,28 +296,6 @@ static int MachineAddItem(Machine *m, ItemID id, int amount) {
         }
     }
     return placed;
-}
-
-// Push ONE item into whatever machine sits at (x,y). Used by the
-// drill to unload onto the belt in front of it — the reason a drill
-// no longer needs an inserter babysitting it.
-static bool MachinePushInto(int x, int y, ItemID id) {
-    Machine *dest = MachineAt(x, y);
-    if (dest == NULL || id <= ITEM_NONE) return false;
-    if (TileIsBelt(dest->type)) {
-        if (dest->slots[0] == ITEM_NONE || dest->counts[0] <= 0) {
-            dest->slots[0] = id; dest->counts[0] = 1; dest->beltProgress = 0;
-            return true;
-        }
-        if (dest->slots[0] == id && dest->counts[0] < BELT_CAPACITY) {
-            dest->counts[0]++;
-            return true;
-        }
-        return false;
-    }
-    if (dest->type == TILE_CHEST)  return MachineAddItem(dest, id, 1) > 0;
-    if (dest->type == TILE_TURRET && id == ITEM_BULLET) { dest->ammo++; return true; }
-    return false;
 }
 
 // ─── Belt corners, auto-formed ────────────────────────────
@@ -343,6 +342,75 @@ static bool MachineAddCoal(Machine *m) {
     if (m->coal >= MACHINE_FUEL_MAX) return false;
     m->coal++;
     return true;
+}
+
+// ─── One rule for "will you take this?" ───────────────────
+// Belts, arms, drills and splitters all used to carry their OWN copy
+// of "a chest takes anything, a turret takes bullets, a belt takes
+// one more if there's room" — four copies that had to be kept in
+// step by hand. This is that rule, once. Every hand-off in the game
+// goes through it, which is why the splitter and the underground
+// belt work with everything the moment they exist.
+static bool MachineAcceptItem(Machine *dest, ItemID id) {
+    if (dest == NULL || id <= ITEM_NONE || id >= ITEM_COUNT) return false;
+    if (TileIsBeltLike(dest->type)) {
+        // A belt tile carries a small STACK of ONE item type. Anything
+        // it can't take stays where it is, so lines back up like real
+        // conveyors instead of quietly deleting cargo.
+        if (dest->slots[0] == ITEM_NONE || dest->counts[0] <= 0) {
+            dest->slots[0] = id; dest->counts[0] = 1; dest->beltProgress = 0;
+            return true;
+        }
+        if (dest->slots[0] == id && dest->counts[0] < BELT_CAPACITY) {
+            dest->counts[0]++;
+            return true;
+        }
+        return false;
+    }
+    if (dest->type == TILE_CHEST) return MachineAddItem(dest, id, 1) > 0;
+    if (dest->type == TILE_TURRET && id == ITEM_BULLET) { dest->ammo++; return true; }
+    if (TileNeedsFuel(dest->type) && id == ITEM_COAL) return MachineAddCoal(dest);
+    return false;
+}
+
+// Push ONE item into whatever machine sits at (x,y). Used by the
+// drill to unload onto the belt in front of it — the reason a drill
+// no longer needs an inserter babysitting it.
+static bool MachinePushInto(int x, int y, ItemID id) {
+    return MachineAcceptItem(MachineAt(x, y), id);
+}
+
+// ─── Where does this piece of belt furniture send things? ─
+// A belt hands cargo to the tile it FACES. A tunnel entrance hands it
+// to its partner mouth, however far away that is — the whole trick of
+// the underground belt is that this one lookup skips the distance.
+static Machine *BeltOutputTarget(const Machine *m) {
+    if (m == NULL) return NULL;
+    if (m->type == TILE_TUNNEL_IN) return MachineAt(m->linkX, m->linkY);
+    return MachineAt(m->x + DIR_DX[m->dir], m->y + DIR_DY[m->dir]);
+}
+
+// A splitter's two mouths: LEFT and RIGHT of its facing. Feed it from
+// behind and one lane becomes two. (`side` 0 = left, 1 = right.)
+static int SplitterOutDir(const Machine *m, int side) {
+    return (side == 0) ? ((m->dir + 3) & 3) : ((m->dir + 1) & 3);
+}
+
+static Machine *SplitterOutput(const Machine *m, int side) {
+    int d = SplitterOutDir(m, side);
+    return MachineAt(m->x + DIR_DX[d], m->y + DIR_DY[d]);
+}
+
+// How long is this tunnel, end to end (in tiles)? That number is
+// what the run COST to lay, so it's also what mining a mouth pays
+// back. An unlinked mouth is worth its own single tile.
+static int TunnelLength(const Machine *m) {
+    if (m == NULL || !TileIsTunnel(m->type)) return 0;
+    if (m->linkX < 0 || m->linkY < 0) return 1;
+    int dx = m->linkX - m->x, dy = m->linkY - m->y;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    return dx + dy + 1;
 }
 
 // Pop ONE item out of the first non-empty slot (inserters grab one
@@ -446,7 +514,7 @@ static bool InserterSelfFuel(Machine *m) {
         int ny = (k < 0) ? m->y - DIR_DY[m->dir] : m->y + DIR_DY[k];
         Machine *n = MachineAt(nx, ny);
         if (n != NULL && n != m &&
-            (n->type == TILE_CHEST || n->type == TILE_DRILL || TileIsBelt(n->type))) {
+            (n->type == TILE_CHEST || n->type == TILE_DRILL || TileIsBeltLike(n->type))) {
             if (MachineTakeSpecific(n, ITEM_COAL) != ITEM_NONE) { m->coal++; return true; }
         }
         if (GroundTakeOneAt(nx, ny, ITEM_COAL) != ITEM_NONE) { m->coal++; return true; }
@@ -487,13 +555,40 @@ static void MachineDropContents(Machine *m) {
 // the contents are salvaged straight into that player's inventory
 // (you mined it); otherwise they hit the FLOOR, where you — or the
 // thing that broke it — can pick them back up.
+//
+// A TUNNEL is one object with two ends: break either mouth and the
+// whole run comes up, refunding every belt it cost. Half a tunnel is
+// not a thing you can own, so it's not a state we allow to exist.
+// The plain half: empty one machine out and free its record.
+static void FreeMachineRecord(Machine *m, Player *giveTo) {
+    if (m == NULL || !m->active) return;
+    if (giveTo != NULL) MachineGiveContentsTo(m, giveTo);
+    else                MachineDropContents(m);
+    if (WorldInBounds(m->x, m->y)) machineIndex[m->x][m->y] = -1;
+    m->active = false;
+}
+
 static void RemoveMachineAt(int x, int y, Player *giveTo) {
     Machine *m = MachineAt(x, y);
     if (m == NULL) return;
-    if (giveTo != NULL) MachineGiveContentsTo(m, giveTo);
-    else                MachineDropContents(m);
-    machineIndex[x][y] = -1;
-    m->active = false;
+
+    if (TileIsTunnel(m->type)) {
+        // Pay the run back ONCE, from whichever end broke, then take
+        // the far mouth out too — no recursion, no double refund.
+        int px = m->linkX, py = m->linkY;
+        int refund = TunnelLength(m);
+        Vector2 at = { (x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE };
+        if (giveTo != NULL) PlayerGiveItem(giveTo, ITEM_TUNNEL, refund);
+        else                DropItemAt(at, ITEM_TUNNEL, refund);
+
+        if (px >= 0 && py >= 0 && WorldInBounds(px, py) &&
+            TileIsTunnel(world[px][py].type)) {
+            FreeMachineRecord(MachineAt(px, py), giveTo);   // cargo only
+            WorldSetTile(px, py, TILE_GRASS);
+        }
+    }
+
+    FreeMachineRecord(m, giveTo);
 }
 
 // Give EVERY tile that needs per-instance state a machine record.
@@ -1049,8 +1144,8 @@ static void UpdateMachines(float dt, Player *p) {
         // Age it first. "Working" means burning fuel, carrying cargo,
         // or standing ready to shoot — an idle machine doesn't age.
         bool working = false;
-        if (TileNeedsFuel(m->type))      working = (m->fuel > 0 || m->coal > 0);
-        else if (TileIsBelt(m->type))    working = (m->slots[0] != ITEM_NONE);
+        if (TileNeedsFuel(m->type))       working = (m->fuel > 0 || m->coal > 0);
+        else if (TileIsBeltLike(m->type)) working = (m->slots[0] != ITEM_NONE);
         else if (m->type == TILE_TURRET) working = (m->ammo > 0);
         else if (m->type == TILE_LASER_TURRET) working = true;
         if (!MachineWearTick(m, dt, working)) continue;   // it just died
@@ -1118,32 +1213,118 @@ static void UpdateMachines(float dt, Player *p) {
             if (m->timer > 0) break;
             m->timer = TUNE.conveyorInterval;
 
-            Machine *dest = MachineAt(m->x + DIR_DX[m->dir], m->y + DIR_DY[m->dir]);
-            if (dest == NULL) break;       // dead end: hold the item
-            ItemID id = m->slots[0];
-            bool moved = false;
-            if (TileIsBelt(dest->type)) {
-                // A belt tile carries a small STACK of one item type.
-                // Anything it can't accept stays put on this tile
-                // instead of evaporating — items never get lost, the
-                // line just backs up like a real conveyor.
-                if (dest->slots[0] == ITEM_NONE || dest->counts[0] <= 0) {
-                    dest->slots[0] = id; dest->counts[0] = 1;
-                    dest->beltProgress = 0;
-                    moved = true;
-                } else if (dest->slots[0] == id && dest->counts[0] < BELT_CAPACITY) {
-                    dest->counts[0]++;
-                    moved = true;
+            // Hand one item to the tile we face. Chests, turrets,
+            // fuel hoppers, splitters, tunnel mouths and other belts
+            // all answer through the one shared rule.
+            if (MachineAcceptItem(BeltOutputTarget(m), m->slots[0])) {
+                if (--m->counts[0] <= 0) {
+                    m->slots[0] = ITEM_NONE; m->counts[0] = 0;
                 }
-            } else if (dest->type == TILE_CHEST) {
-                moved = MachineAddItem(dest, id, 1) > 0;
-            } else if (dest->type == TILE_TURRET && id == ITEM_BULLET) {
-                dest->ammo += 1; moved = true;    // belt-fed turrets!
-            } else if (TileNeedsFuel(dest->type) && id == ITEM_COAL) {
-                moved = MachineAddCoal(dest);     // belt-fed fuel!
+                m->beltProgress = 0;
             }
-            if (moved && --m->counts[0] <= 0) {
-                m->slots[0] = ITEM_NONE; m->counts[0] = 0;
+            break;
+        }
+
+        case TILE_SPLITTER: {
+            // ── One lane in, two lanes out ──────────────────────
+            // Items arrive from behind (or from any belt pointing at
+            // it) and leave through the tiles to its LEFT and RIGHT,
+            // alternating — that alternation is the whole machine.
+            //
+            // With a FILTER set it stops alternating and starts
+            // SORTING: the filtered item only ever goes left, and
+            // everything else only ever goes right. A filtered item
+            // waits for its own lane rather than escaping down the
+            // wrong one, which is the entire point of saying so.
+            if (m->slots[0] == ITEM_NONE || m->counts[0] <= 0) {
+                m->beltProgress = 0;
+                m->timer = SPLITTER_INTERVAL;
+                break;
+            }
+            m->timer -= dt;
+            m->beltProgress = 1.0f - (m->timer / SPLITTER_INTERVAL);
+            if (m->beltProgress < 0) m->beltProgress = 0;
+            if (m->beltProgress > 1) m->beltProgress = 1;
+            if (m->timer > 0) break;
+            m->timer = SPLITTER_INTERVAL;
+
+            ItemID id = m->slots[0];
+            bool sent = false;
+            if (m->filter != ITEM_NONE) {
+                int side = (id == m->filter) ? 0 : 1;      // left : right
+                sent = MachineAcceptItem(SplitterOutput(m, side), id);
+            } else {
+                // Round robin, and if the side whose turn it is won't
+                // take it, offer the other — one blocked branch must
+                // never stall the whole line.
+                for (int attempt = 0; attempt < 2 && !sent; attempt++) {
+                    int side = (m->splitToggle + attempt) & 1;
+                    sent = MachineAcceptItem(SplitterOutput(m, side), id);
+                    if (sent) m->splitToggle = (side + 1) & 1;
+                }
+            }
+            if (sent) {
+                if (--m->counts[0] <= 0) { m->slots[0] = ITEM_NONE; m->counts[0] = 0; }
+                m->beltProgress = 0;
+            }
+            break;
+        }
+
+        case TILE_TUNNEL_IN: {
+            // The mouth items go down. It behaves exactly like a belt
+            // whose next tile happens to be somewhere else entirely:
+            // BeltOutputTarget returns the partner mouth, so LENGTH
+            // costs nothing at all here — no queue to walk, no timers
+            // per tile. That's what makes "any length" honest.
+            if (m->slots[0] == ITEM_NONE || m->counts[0] <= 0) {
+                m->beltProgress = 0;
+                m->timer = TUNNEL_INTERVAL;
+                break;
+            }
+            m->timer -= dt;
+            m->beltProgress = 1.0f - (m->timer / TUNNEL_INTERVAL);
+            if (m->beltProgress < 0) m->beltProgress = 0;
+            if (m->beltProgress > 1) m->beltProgress = 1;
+            if (m->timer > 0) break;
+            m->timer = TUNNEL_INTERVAL;
+
+            if (MachineAcceptItem(BeltOutputTarget(m), m->slots[0])) {
+                if (--m->counts[0] <= 0) { m->slots[0] = ITEM_NONE; m->counts[0] = 0; }
+                m->beltProgress = 0;
+            }
+            break;
+        }
+
+        case TILE_TUNNEL_OUT: {
+            // ...and the mouth they come back up from: a plain belt
+            // tile that unloads onto whatever it faces.
+            if (m->slots[0] == ITEM_NONE || m->counts[0] <= 0) {
+                m->beltProgress = 0;
+                m->timer = TUNE.conveyorInterval;
+                break;
+            }
+            m->timer -= dt;
+            m->beltProgress = 1.0f - (m->timer / TUNE.conveyorInterval);
+            if (m->beltProgress < 0) m->beltProgress = 0;
+            if (m->beltProgress > 1) m->beltProgress = 1;
+            if (m->timer > 0) break;
+            m->timer = TUNE.conveyorInterval;
+
+            Machine *dest = MachineAt(m->x + DIR_DX[m->dir], m->y + DIR_DY[m->dir]);
+            ItemID id = m->slots[0];
+            bool sent = MachineAcceptItem(dest, id);
+            // Nothing there to take it? Set it on the ground in front,
+            // the way an arm does — a tunnel that ends in open dirt
+            // still delivers instead of silently plugging itself.
+            if (!sent && dest == NULL) {
+                int fx = m->x + DIR_DX[m->dir], fy = m->y + DIR_DY[m->dir];
+                if (GroundTileFree(fx, fy)) {
+                    sent = DropItemAt((Vector2){ (fx + 0.5f) * TILE_SIZE,
+                                                 (fy + 0.5f) * TILE_SIZE }, id, 1);
+                }
+            }
+            if (sent) {
+                if (--m->counts[0] <= 0) { m->slots[0] = ITEM_NONE; m->counts[0] = 0; }
                 m->beltProgress = 0;
             }
             break;
@@ -1179,18 +1360,25 @@ static void UpdateMachines(float dt, Player *p) {
             m->timer = TUNE.inserterInterval;
 
             if (m->slots[0] == ITEM_NONE) {   // hand empty → try to grab
-                // A fuel burner in front only ever accepts COAL, so
-                // the arm goes looking for coal specifically. Grabbing
-                // the first thing it touched is what used to leave
-                // arms stood there holding an ore plate forever.
+                // WHAT is this arm allowed to pick up?
+                //   a filter set by hand   → only that item, ever
+                //   a fuel burner in front → coal, because that's the
+                //                            only thing it can accept
+                //   otherwise              → the first thing it touches
+                // Grabbing indiscriminately is what used to leave arms
+                // stood there holding an ore plate forever, in front of
+                // a machine that only wanted coal.
                 bool feeding = (dest != NULL && TileNeedsFuel(dest->type));
-                if (!feeding || dest->coal < MACHINE_FUEL_MAX) {
-                    ItemID want = feeding ? ITEM_COAL : ITEM_NONE;
+                ItemID want = (m->filter != ITEM_NONE) ? m->filter
+                            : (feeding ? ITEM_COAL : ITEM_NONE);
+                bool blocked = feeding && want == ITEM_COAL &&
+                               dest->coal >= MACHINE_FUEL_MAX;
+                if (!blocked) {
                     ItemID got = ITEM_NONE;
                     if (src != NULL && (src->type == TILE_CHEST || src->type == TILE_DRILL ||
-                                        TileIsBelt(src->type))) {
-                        got = feeding ? MachineTakeSpecific(src, ITEM_COAL)
-                                      : MachineTakeItem(src);
+                                        TileIsBeltLike(src->type))) {
+                        got = (want != ITEM_NONE) ? MachineTakeSpecific(src, want)
+                                                  : MachineTakeItem(src);
                     }
                     // Nothing behind it? Pick the floor up instead.
                     if (got == ITEM_NONE) got = GroundTakeOneAt(bx, by, want);
@@ -1201,23 +1389,7 @@ static void UpdateMachines(float dt, Player *p) {
                 ItemID id = m->slots[0];
                 bool placed = false;
                 if (dest != NULL) {
-                    if (dest->type == TILE_CHEST) placed = MachineAddItem(dest, id, 1) > 0;
-                    else if (TileIsBelt(dest->type)) {
-                        if (dest->slots[0] == ITEM_NONE || dest->counts[0] <= 0) {
-                            dest->slots[0] = id; dest->counts[0] = 1;
-                            dest->beltProgress = 0;
-                            placed = true;
-                        } else if (dest->slots[0] == id && dest->counts[0] < BELT_CAPACITY) {
-                            dest->counts[0]++;
-                            placed = true;
-                        }
-                    }
-                    else if (dest->type == TILE_TURRET && id == ITEM_BULLET) {
-                        dest->ammo += 1; placed = true;
-                    }
-                    else if (TileNeedsFuel(dest->type) && id == ITEM_COAL) {
-                        placed = MachineAddCoal(dest);   // arms can refuel arms
-                    }
+                    placed = MachineAcceptItem(dest, id);
                 } else if (GroundTileFree(fx, fy)) {
                     // Nothing in front to hand it to → set it on the
                     // floor, exactly like an arm unloading onto the
@@ -1451,7 +1623,7 @@ static void BeltPickupNear(Player *p, float radiusPx) {
     for (int x = cx - r; x <= cx + r; x++) {
         for (int y = cy - r; y <= cy + r; y++) {
             if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_SIZE) continue;
-            if (!TileIsBelt(world[x][y].type)) continue;
+            if (!TileIsBeltLike(world[x][y].type)) continue;
             Vector2 c = { (x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE };
             if (Vector2Distance(p->pos, c) > radiusPx) continue;
             Machine *m = MachineAt(x, y);
@@ -1481,6 +1653,17 @@ static void EntitiesReconcile(void) {
         if (world[m->x][m->y].type != m->type) {
             if (machineIndex[m->x][m->y] == (short)i) machineIndex[m->x][m->y] = -1;
             m->active = false;
+            continue;
+        }
+        // A tunnel mouth whose partner is gone (blown up, chewed,
+        // loaded from a stale save) is ORPHANED. Forget the dead link
+        // rather than pointing at whatever moved in — the drawing
+        // shows the mouth as broken, and mining it refunds one tile.
+        if (TileIsTunnel(m->type) && m->linkX >= 0 && m->linkY >= 0) {
+            if (!WorldInBounds(m->linkX, m->linkY) ||
+                !TileIsTunnel(world[m->linkX][m->linkY].type)) {
+                m->linkX = m->linkY = -1;
+            }
         }
     }
 }
@@ -1524,6 +1707,35 @@ static void EntitiesDrawWorld(Vector2 viewTopLeft, Vector2 viewBottomRight) {
     if (y0 < 0) y0 = 0;
     if (x1 > WORLD_SIZE - 1) x1 = WORLD_SIZE - 1;
     if (y1 > WORLD_SIZE - 1) y1 = WORLD_SIZE - 1;
+
+    // ── Buried belt runs ──────────────────────────────────
+    // The tunnel itself is invisible by definition, so we draw the
+    // faintest possible ghost of it: a dotted line between the two
+    // mouths, under everything else. Without it a base full of
+    // underground belts is a base you can't read. Walked from the
+    // ENTRANCE only, so a run is drawn once, not twice.
+    for (int i = 0; i < MAX_MACHINES; i++) {
+        Machine *tm = &machines[i];
+        if (!tm->active || tm->type != TILE_TUNNEL_IN) continue;
+        if (tm->linkX < 0 || tm->linkY < 0) continue;
+        Vector2 a = { (tm->x + 0.5f) * TILE_SIZE, (tm->y + 0.5f) * TILE_SIZE };
+        Vector2 b = { (tm->linkX + 0.5f) * TILE_SIZE, (tm->linkY + 0.5f) * TILE_SIZE };
+        // Cheap reject: both ends far off the same side of the view.
+        if ((a.x < viewTopLeft.x && b.x < viewTopLeft.x) ||
+            (a.x > viewBottomRight.x && b.x > viewBottomRight.x) ||
+            (a.y < viewTopLeft.y && b.y < viewTopLeft.y) ||
+            (a.y > viewBottomRight.y && b.y > viewBottomRight.y)) continue;
+        int steps = TunnelLength(tm);
+        float crawl = fmodf((float)GetTime() * 1.6f, 1.0f);
+        for (int s = 0; s < steps; s++) {
+            float f = (s + 0.5f) / steps;
+            Vector2 dot = { a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f };
+            // One pip travels the line so you can see which way it runs.
+            bool head = (fabsf(f - crawl) < 0.5f / steps);
+            DrawCircleV(dot, head ? 2.6f : 1.6f,
+                        head ? (Color){ 190, 170, 255, 190 } : (Color){ 120, 108, 180, 90 });
+        }
+    }
 
     for (int x = x0; x <= x1; x++) {
         for (int y = y0; y <= y1; y++) {
@@ -1592,6 +1804,74 @@ static void EntitiesDrawWorld(Vector2 viewTopLeft, Vector2 viewBottomRight) {
                 Vector2 rght = { center.x + dy * 4.5f - dx * 2.0f, center.y - dx * 4.5f - dy * 2.0f };
                 DrawTriangle(tip, left, rght, (Color){ 255, 255, 255, 190 });
                 DrawTriangle(tip, rght, left, (Color){ 255, 255, 255, 190 });
+            } else if (t == TILE_SPLITTER) {
+                // ── Splitter ───────────────────────────────────
+                // A housing with the input chevron coming in from
+                // behind and two output arrows leaving sideways —
+                // you can read which way it splits from across the
+                // base, without opening anything.
+                float ts = (float)TILE_SIZE;
+                DrawRectangle((int)px, (int)py, TILE_SIZE, TILE_SIZE, (Color){ 66, 58, 44, 255 });
+                DrawRectangleLines((int)px, (int)py, TILE_SIZE, TILE_SIZE, (Color){ 34, 32, 28, 255 });
+                float dx = (float)DIR_DX[dir], dy = (float)DIR_DY[dir];
+                // Feed chevron, sliding in from the back edge.
+                float phase = fmodf((float)GetTime() / SPLITTER_INTERVAL, 1.0f);
+                float in = -0.5f + phase * 0.5f;
+                DrawLineEx((Vector2){ center.x + dx * ts * in - (-dy) * 7.0f,
+                                      center.y + dy * ts * in - dx * 7.0f },
+                           (Vector2){ center.x + dx * ts * in + (-dy) * 7.0f,
+                                      center.y + dy * ts * in + dx * 7.0f },
+                           3.0f, (Color){ 176, 156, 60, 210 });
+                // The two output arrows.
+                for (int side = 0; side < 2; side++) {
+                    int od = (side == 0) ? ((dir + 3) & 3) : ((dir + 1) & 3);
+                    float ox = (float)DIR_DX[od], oy = (float)DIR_DY[od];
+                    Vector2 tip  = { center.x + ox * 10.0f, center.y + oy * 10.0f };
+                    Vector2 lft  = { center.x - oy * 4.5f - ox * 2.0f,
+                                     center.y + ox * 4.5f - oy * 2.0f };
+                    Vector2 rgt  = { center.x + oy * 4.5f - ox * 2.0f,
+                                     center.y - ox * 4.5f - oy * 2.0f };
+                    Color arrow = (Color){ 255, 255, 255, 190 };
+                    // With a filter on, the two lanes mean different
+                    // things, so they stop looking the same: the
+                    // filtered lane goes orange, the reject lane gray.
+                    if (m != NULL && m->filter != ITEM_NONE) {
+                        arrow = (side == 0) ? (Color){ 255, 166, 2, 230 }
+                                            : (Color){ 150, 150, 158, 200 };
+                    }
+                    DrawTriangle(tip, lft, rgt, arrow);
+                    DrawTriangle(tip, rgt, lft, arrow);
+                }
+            } else if (TileIsTunnel(t)) {
+                // ── Underground belt mouth ─────────────────────
+                // A ramp: bars that shrink as they go down (entrance)
+                // or grow as they come up (exit), so which end you're
+                // looking at is obvious from the slope alone.
+                bool goingDown = (t == TILE_TUNNEL_IN);
+                DrawRectangle((int)px, (int)py, TILE_SIZE, TILE_SIZE, (Color){ 48, 44, 70, 255 });
+                DrawRectangleLines((int)px, (int)py, TILE_SIZE, TILE_SIZE, (Color){ 26, 24, 40, 255 });
+                float dx = (float)DIR_DX[dir], dy = (float)DIR_DY[dir];
+                for (int k = 0; k < 4; k++) {
+                    float u = -0.36f + k * 0.24f;          // back → front
+                    float shrink = goingDown ? (1.0f - k * 0.22f) : (0.34f + k * 0.22f);
+                    float ax = center.x + dx * TILE_SIZE * u;
+                    float ay = center.y + dy * TILE_SIZE * u;
+                    unsigned char a = (unsigned char)(90 + 40 * k);
+                    DrawLineEx((Vector2){ ax - (-dy) * 7.0f * shrink, ay - dx * 7.0f * shrink },
+                               (Vector2){ ax + (-dy) * 7.0f * shrink, ay + dx * 7.0f * shrink },
+                               2.5f, (Color){ 168, 152, 228, a });
+                }
+                Vector2 tip  = { center.x + dx * 9.0f, center.y + dy * 9.0f };
+                Vector2 lft  = { center.x - dy * 4.0f - dx * 1.0f, center.y + dx * 4.0f - dy * 1.0f };
+                Vector2 rgt  = { center.x + dy * 4.0f - dx * 1.0f, center.y - dx * 4.0f - dy * 1.0f };
+                Color nose = goingDown ? (Color){ 200, 190, 255, 210 } : (Color){ 255, 255, 255, 210 };
+                DrawTriangle(tip, lft, rgt, nose);
+                DrawTriangle(tip, rgt, lft, nose);
+                // An orphaned mouth (its partner was destroyed) is
+                // dead weight — say so instead of letting it look fine.
+                if (m != NULL && (m->linkX < 0 || m->linkY < 0)) {
+                    DrawRectangleLines((int)px, (int)py, TILE_SIZE, TILE_SIZE, RED);
+                }
             } else if (t == TILE_DOOR || t == TILE_CHEST || t == TILE_DRILL ||
                        t == TILE_INSERTER || t == TILE_TURRET ||
                        t == TILE_LASER_TURRET || t == TILE_RESEARCH) {
@@ -1660,24 +1940,41 @@ static void EntitiesDrawWorld(Vector2 viewTopLeft, Vector2 viewBottomRight) {
             // Cargo. On a belt it SLIDES along the path as
             // beltProgress advances, so you can watch items travel.
             // (The inserter draws its own cargo in the claw, above.)
-            if (m->slots[0] != ITEM_NONE && m->counts[0] > 0 && TileIsBelt(t)) {
+            if (m->slots[0] != ITEM_NONE && m->counts[0] > 0 && TileIsBeltLike(t)) {
                 Vector2 at = center;
-                if (TileIsBelt(t)) {
-                    float u = m->beltProgress - 0.5f;         // -0.5 .. +0.5
-                    if (t == TILE_CONVEYOR_CORNER && m->beltProgress < 0.5f) {
-                        float sx = -(float)DIR_DY[dir], sy = (float)DIR_DX[dir];
-                        at.x -= sx * TILE_SIZE * (0.5f - m->beltProgress);
-                        at.y -= sy * TILE_SIZE * (0.5f - m->beltProgress);
-                    } else {
-                        at.x += DIR_DX[dir] * TILE_SIZE * u;
-                        at.y += DIR_DY[dir] * TILE_SIZE * u;
-                    }
+                float u = m->beltProgress - 0.5f;         // -0.5 .. +0.5
+                if (t == TILE_CONVEYOR_CORNER && m->beltProgress < 0.5f) {
+                    float sx = -(float)DIR_DY[dir], sy = (float)DIR_DX[dir];
+                    at.x -= sx * TILE_SIZE * (0.5f - m->beltProgress);
+                    at.y -= sy * TILE_SIZE * (0.5f - m->beltProgress);
+                } else if (t == TILE_SPLITTER) {
+                    // Cargo drifts from the back of the splitter to
+                    // the mouth it's about to leave by.
+                    int side = (m->filter != ITEM_NONE)
+                             ? ((m->slots[0] == m->filter) ? 0 : 1) : (m->splitToggle & 1);
+                    int od = SplitterOutDir(m, side);
+                    float back = 0.5f - m->beltProgress;
+                    at.x += -DIR_DX[dir] * TILE_SIZE * back * 0.6f +
+                             DIR_DX[od] * TILE_SIZE * m->beltProgress * 0.5f;
+                    at.y += -DIR_DY[dir] * TILE_SIZE * back * 0.6f +
+                             DIR_DY[od] * TILE_SIZE * m->beltProgress * 0.5f;
+                } else {
+                    at.x += DIR_DX[dir] * TILE_SIZE * u;
+                    at.y += DIR_DY[dir] * TILE_SIZE * u;
                 }
                 DrawItemSprite(m->slots[0], at.x - 7, at.y - 7, 14);
                 if (m->counts[0] > 1) {
                     DrawText(TextFormat("%d", m->counts[0]), (int)(at.x + 5),
                              (int)(at.y + 1), 10, RAYWHITE);
                 }
+            }
+
+            // A filtered machine wears the item it sorts for, small,
+            // in its top-left corner — the setting is visible on the
+            // factory floor, not buried in a panel.
+            if (TileHasFilter(t) && m->filter != ITEM_NONE) {
+                DrawRectangle((int)px + 1, (int)py + 1, 11, 11, (Color){ 18, 16, 22, 210 });
+                DrawItemSprite(m->filter, px + 1.5f, py + 1.5f, 10);
             }
 
             if (t == TILE_TURRET) {
@@ -1999,6 +2296,12 @@ static bool EntitiesRead(FILE *f) {
             continue;
         }
         m->dir &= 3;
+        // Untrusted file data: a bogus filter would index ITEMS[] out
+        // of range, and a bogus tunnel link would send cargo into the
+        // void. Both fail SAFE — no filter, no link.
+        if (m->filter < ITEM_NONE || m->filter >= ITEM_COUNT) m->filter = ITEM_NONE;
+        if (!WorldInBounds(m->linkX, m->linkY)) m->linkX = m->linkY = -1;
+        m->splitToggle &= 1;
         machineIndex[m->x][m->y] = (short)i;
     }
     float worldMax = (float)(WORLD_SIZE * TILE_SIZE);

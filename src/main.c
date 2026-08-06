@@ -35,6 +35,7 @@
 #include "world.h"      // the 2D tile grid + WorldDamageTile etc.
 #include "player.h"     // the Player struct + movement/inventory
 #include "entities.h"   // mobs, machines, bots, projectiles, bombs
+#include "saves.h"      // the eight save slots + their metadata
 #include "ui.h"         // buttons, hotbar, menus
 #include "debug.h"      // the F3 live-tuning console
 
@@ -63,7 +64,7 @@ static Camera2D camera = { 0 };      // raylib camera that follows the player
 // field becomes 0/false/NULL. Without it, file-scope statics are
 // zeroed anyway, but writing it makes the intent explicit.
 static UIButton titleStartButton    = { 0 };
-static UIButton titleContinueButton = { 0 };
+static UIButton titleSavesButton    = { 0 };
 static UIButton gameSavesBackButton = { 0 };
 static UIButton titleQuitButton     = { 0 };
 static UIButton pauseSaveButton     = { 0 };
@@ -79,6 +80,8 @@ static const struct { const char *keys; const char *action; } CONTROLS[] = {
     { "W A S D",      "Move (works with menus open)" },
     { "Left click",   "Build (holding a block) / mine / shoot" },
     { "Right click",  "Open block panels; in crafting, craft 5" },
+    { "Drag (belt)",  "Underground belt: drag out the run, release to lay" },
+    { "Filter slot",  "Inserter / splitter: click to pick an item, RMB clears" },
     { "Q",            "Close menus, draw / cycle weapons" },
     { "Z (drag)",     "Feed coal to drills / inserters" },
     { "F (hold)",     "Gather items off belts and off the ground" },
@@ -109,24 +112,34 @@ static float weaponCooldown = 0;
 // one-lump-per-machine instead of one-per-frame.
 static int   zFuelLastTile = -1;
 
-// Save files start with a tiny header so we can recognize our own
-// files and reject garbage. `char magic[4]` holds the 4 letters
-// "HPSV" (Home Planet SaVe) — a common trick called a magic number.
-typedef struct {
-    char magic[4];
-    int  version;   // bump this when the save format changes
-} SaveHeader;
+// ─── The underground-belt tool ───────────────────────────────
+// An underground belt isn't PLACED, it's DRAWN: press the button on
+// the tile the run starts at, drag out to where it should surface,
+// let go. Between press and release the world shows a neon line of
+// exactly what you're about to build and what it will cost — which
+// is the only reason a belt of unlimited length is usable at all.
+static bool tunnelDragging = false;
+static int  tunnelAnchorX = -1, tunnelAnchorY = -1;
+
+// (SaveHeader moved to saves.h — it grew a name, a date, a playtime
+// and a thumbnail, and the saves screen reads it without ever
+// touching the body of the file. It still opens with the 4 letters
+// "HPSV" and a version number: a magic number, so we can recognize
+// our own files and reject garbage.)
 
 #define SAVE_MAGIC "HPSV"
 // BUMP THIS whenever a saved struct's SIZE or LAYOUT changes —
 // including the machine pool's length. A stale block that still
 // passes the version check reads as garbage or fails halfway, and
 // the recovery path throws away state that looked fine on disk.
-#define SAVE_VERSION 7   // v7: loose ground items + auto-craft state
-// ...but v7 only APPENDED blocks; every struct it shares with v6 has
-// the same layout, and every new block is optional on read. So we
-// still accept v6 files instead of throwing away someone's world.
-#define SAVE_VERSION_MIN 6
+#define SAVE_VERSION 9   // v9: named, dated, previewed save SLOTS
+// Older files CANNOT be read, and this is the honest reason: v8 added
+// items and tiles (so Player's inventory arrays changed size) and
+// sorting/link fields to Machine; v9 then grew the header itself. A
+// v7 file read as v9 is not "mostly right", it's garbage that happens
+// to pass a size check. Refusing it loudly beats a corrupted world.
+// (A rejected file is left ALONE on disk, never overwritten.)
+#define SAVE_VERSION_MIN 9
 
 // (CraftableCount and CraftableAtRow used to live here; they moved
 // to gamedata.h because ui.h needs them too — pure table queries
@@ -292,12 +305,33 @@ static void ValidateLoadedCraftQueue(Player *p) {
 // exact same build (struct layout, sizes). Fine for a toy save;
 // real games use versioned/serialized formats. (The magic+version
 // header is our small nod toward that.)
-static void GameSave(void) {
+// Which slot is this playthrough attached to? -1 means "not saved
+// anywhere yet" — the state you're in when every slot was full at the
+// moment you hit NEW GAME. Saving then asks you where to put it
+// rather than quietly landing on top of someone else's world.
+static int saveSlotActive = -1;
+
+static bool GameSaveTo(int slot) {
+    if (slot < 0 || slot >= SAVE_SLOTS) return false;
+    SavesEnsureDir();
     // "wb" = Write, Binary. fopen returns NULL on failure (disk
     // full, no permission...), so check before using it.
-    FILE *f = fopen(SAVE_FILE, "wb");
-    if (f == NULL) return;
-    SaveHeader header = { {'H','P','S','V'}, SAVE_VERSION };
+    FILE *f = fopen(SaveSlotPath(slot), "wb");
+    if (f == NULL) return false;
+
+    // The header now describes the save well enough to pick it out of
+    // a menu. A slot that already has a name KEEPS it — saving is not
+    // renaming, and a world you christened shouldn't quietly revert.
+    SaveHeader header = { 0 };
+    memcpy(header.magic, SAVE_MAGIC, 4);
+    header.version = SAVE_VERSION;
+    SaveHeader existing;
+    if (SaveReadHeader(slot, SAVE_VERSION, &existing)) SaveSetName(header.name, existing.name);
+    else                                               SaveSetName(header.name, SaveDefaultName(slot));
+    header.stamp = (long long)time(NULL);
+    header.playSeconds = (int)entGameTime;
+    SaveBuildPreview(player.pos, header.preview);
+
     // fwrite(pointer-to-data, size-of-one, how-many, file)
     fwrite(&header, sizeof(header), 1, f);
     fwrite(&player, sizeof(player), 1, f);
@@ -313,10 +347,16 @@ static void GameSave(void) {
     fwrite(autoCraftTarget, sizeof(autoCraftTarget), 1, f);
     fwrite(craftPaid,       sizeof(craftPaid),       1, f);
     fclose(f);  // ALWAYS close what you open, or data may never hit disk.
+    saveSlotActive = slot;
+    return true;
 }
 
-static bool GameLoad(void) {
-    FILE *f = fopen(SAVE_FILE, "rb");   // Read, Binary
+// Save to wherever this playthrough already lives.
+static bool GameSave(void) { return GameSaveTo(saveSlotActive); }
+
+static bool GameLoadFrom(int slot) {
+    if (slot < 0 || slot >= SAVE_SLOTS) return false;
+    FILE *f = fopen(SaveSlotPath(slot), "rb");   // Read, Binary
     if (f == NULL) return false;        // no save file → report failure
 
     // Measure the file: seek to the END, ask "where am I?" (ftell),
@@ -403,8 +443,12 @@ static bool GameLoad(void) {
     ValidateLoadedCraftQueue(&player);
     fclose(f);
     worldMinimapDirty = true;   // new map on screen → new minimap
+    saveSlotActive = slot;      // from here on, SAVE means "this slot"
     return true;
 }
+
+// Reload whatever slot is being played (F9, and the pause menu).
+static bool GameLoad(void) { return GameLoadFrom(saveSlotActive); }
 
 // Everything a brand-new world needs, in the right order.
 static void NewGame(void) {
@@ -412,6 +456,177 @@ static void NewGame(void) {
     PlayerInit(&player);
     EntitiesReset();
     EntitiesRegisterWorldMachines();   // give every spawner its brain
+}
+
+// ─── Saved worlds screen ─────────────────────────────────────
+// The grid of eight cards. Three things can happen on a card, and
+// they never fight over the same pixels: the BODY loads the world,
+// the NAME STRIP starts a rename, and the [x] deletes — but only on
+// a second click, because a world is hours of somebody's evening and
+// there is no undo for a file that's gone.
+//
+// `savesPickMode` is the other way in: the pause menu sends you here
+// when the game you're playing has no slot yet, and then clicking an
+// EMPTY card means "save here" rather than "start a new world here".
+static int  savesRenaming = -1;                 // slot being typed into
+static char savesNameBuf[SAVE_NAME_MAX] = { 0 };
+static int  savesConfirmDelete = -1;            // slot awaiting its 2nd click
+static bool savesPickMode = false;              // "choose where to save"
+static Screen savesReturnTo = SCREEN_TITLE;     // where BACK goes
+
+static void OpenSavesScreen(bool pickMode, Screen returnTo) {
+    SavesRefresh(SAVE_VERSION);
+    savesRenaming = -1;
+    savesConfirmDelete = -1;
+    savesPickMode = pickMode;
+    savesReturnTo = returnTo;
+    screen = SCREEN_GAME_SAVES;
+}
+
+static void CloseSavesScreen(void) {
+    SavesUnloadThumbs();     // eight textures we no longer need
+    savesRenaming = -1;
+    savesConfirmDelete = -1;
+    screen = savesReturnTo;
+}
+
+// Commit whatever is in the text field to the slot's header.
+static void SavesCommitRename(void) {
+    if (savesRenaming < 0) return;
+    SaveRenameSlot(savesRenaming, SAVE_VERSION, savesNameBuf);
+    savesRenaming = -1;
+    SavesRefresh(SAVE_VERSION);
+}
+
+static void LayoutSavesButtons(void) {
+    SavesLayout l = { 0 };
+    UiGetSavesLayout(&l);
+    gameSavesBackButton.rect = (Rectangle){ (float)(GetScreenWidth() / 2 - 110),
+                                            (float)(l.y + l.h + 34), 220, 50 };
+    gameSavesBackButton.text = "BACK";
+}
+
+static void UpdateGameSaves(void) {
+    LayoutSavesButtons();
+    SavesLayout l = { 0 };
+    UiGetSavesLayout(&l);
+    Vector2 mouse = GetMousePosition();
+
+    // ── Typing a name ────────────────────────────────────────
+    // While the field is live it owns the keyboard: Enter keeps the
+    // name, Escape throws the edit away, and nothing else on this
+    // screen responds until one of those happens.
+    if (savesRenaming >= 0) {
+        int ch = GetCharPressed();
+        while (ch > 0) {
+            int len = (int)strlen(savesNameBuf);
+            if (ch >= 32 && ch < 127 && len < SAVE_NAME_MAX - 1) {
+                savesNameBuf[len] = (char)ch;
+                savesNameBuf[len + 1] = '\0';
+            }
+            ch = GetCharPressed();
+        }
+        if (IsKeyPressed(KEY_BACKSPACE)) {
+            int len = (int)strlen(savesNameBuf);
+            if (len > 0) savesNameBuf[len - 1] = '\0';
+        }
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+            SavesCommitRename();
+            return;
+        }
+        if (IsKeyPressed(KEY_ESCAPE)) { savesRenaming = -1; return; }
+        // Clicking anywhere else finishes the edit rather than
+        // discarding it — the same way every text field you've used
+        // behaves. The click itself is spent doing that and nothing
+        // more, so you never rename AND load in one gesture.
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+            !CheckCollisionPointRec(mouse, UiSaveNameRect(&l, savesRenaming))) {
+            SavesCommitRename();
+            return;
+        }
+        return;
+    }
+
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        if (savesConfirmDelete >= 0) savesConfirmDelete = -1;   // back out of the warning
+        else CloseSavesScreen();
+        return;
+    }
+    if (UiButtonUpdate(&gameSavesBackButton)) {
+        CloseSavesScreen();
+        return;
+    }
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+
+    for (int slot = 0; slot < SAVE_SLOTS; slot++) {
+        Rectangle card = UiSaveCardRect(&l, slot);
+        if (!CheckCollisionPointRec(mouse, card)) continue;
+
+        // A file we can't read is not a slot you can use. Clicking it
+        // does nothing at all — the alternative is destroying a world
+        // we merely failed to parse.
+        if (saveSlots[slot].blocked) return;
+
+        if (!saveSlots[slot].used) {
+            // An empty card: park the current world here, or start a
+            // new one — whichever this screen was opened to do.
+            if (savesPickMode) {
+                GameSaveTo(slot);
+                CloseSavesScreen();
+            } else {
+                NewGame();
+                GameSaveTo(slot);        // so the slot exists immediately
+                savesReturnTo = SCREEN_GAME;
+                CloseSavesScreen();
+            }
+            return;
+        }
+
+        // Delete, in two clicks. The first arms it, the second does
+        // it, and clicking anything else disarms — so a slipped
+        // finger can't cost you a world.
+        if (CheckCollisionPointRec(mouse, UiSaveDeleteRect(&l, slot))) {
+            if (savesConfirmDelete == slot) {
+                SaveDeleteSlot(slot);
+                if (saveSlotActive == slot) saveSlotActive = -1;
+                savesConfirmDelete = -1;
+                SavesRefresh(SAVE_VERSION);
+            } else {
+                savesConfirmDelete = slot;
+            }
+            return;
+        }
+        savesConfirmDelete = -1;   // clicked elsewhere → disarm
+
+        if (CheckCollisionPointRec(mouse, UiSaveNameRect(&l, slot))) {
+            savesRenaming = slot;
+            SaveSetName(savesNameBuf, saveSlots[slot].head.name);
+            return;
+        }
+
+        // The card body: play this world. In "where do I save?" mode
+        // an occupied card does NOTHING — writing over someone's
+        // world is the one action here with no undo, so it isn't
+        // offered at all. Delete a slot first if you want the room.
+        if (savesPickMode) return;
+        if (GameLoadFrom(slot)) {
+            savesReturnTo = SCREEN_GAME;
+            CloseSavesScreen();
+        }
+        return;
+    }
+
+    savesConfirmDelete = -1;   // clicked the background → disarm
+}
+
+static void DrawGameSaves(void) {
+    UiDrawSavesScreen(savesRenaming, savesNameBuf, savesConfirmDelete);
+    LayoutSavesButtons();
+    UiDrawButton(&gameSavesBackButton);
+    if (savesPickMode) {
+        const char *note = "pick an EMPTY slot to save this world into";
+        DrawText(note, GetScreenWidth() / 2 - MeasureText(note, 18) / 2, 24, 18, UI_ACCENT);
+    }
 }
 
 // ─── One slot, anywhere ──────────────────────────────────────
@@ -448,6 +663,115 @@ static void SlotTransfer(SlotRef from, SlotRef to) {
     }
 }
 
+// ─── Planning one underground belt ───────────────────────────
+// Takes the anchor tile and wherever the cursor currently is, and
+// answers the only question that matters: "if I let go now, what
+// gets built, what does it cost, and why not?" ONE function decides
+// it, so the neon preview and the actual build can never disagree
+// about whether a run is legal — the preview IS the rule.
+typedef struct {
+    bool  valid;
+    int   ax, ay;         // entrance tile
+    int   bx, by;         // exit tile
+    int   dir;            // which way cargo travels
+    int   length;         // tiles end to end — and the belt cost
+    const char *problem;  // one line for the readout when !valid
+} TunnelPlan;
+
+static TunnelPlan TunnelPlanFor(int ax, int ay, Vector2 mouseWorld) {
+    TunnelPlan plan = { 0 };
+    plan.ax = ax; plan.ay = ay;
+    plan.bx = ax; plan.by = ay;
+    plan.problem = "";
+
+    int mx = (int)(mouseWorld.x / TILE_SIZE), my = (int)(mouseWorld.y / TILE_SIZE);
+    // SNAP TO AN AXIS. A belt runs in straight lines, so the drag
+    // commits to whichever direction you've pulled further — no
+    // diagonal to disambiguate, no L-shape to guess at.
+    int dx = mx - ax, dy = my - ay;
+    int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    if (adx >= ady) { plan.bx = mx; plan.by = ay; plan.dir = (dx >= 0) ? 0 : 2; }
+    else            { plan.bx = ax; plan.by = my; plan.dir = (dy >= 0) ? 1 : 3; }
+
+    int span = (adx >= ady) ? adx : ady;
+    plan.length = span + 1;
+
+    if (!WorldInBounds(plan.ax, plan.ay) || !WorldInBounds(plan.bx, plan.by)) {
+        plan.problem = "off the map";
+        return plan;
+    }
+    if (plan.length < 2) { plan.problem = "drag out a length"; return plan; }
+    if (plan.length > TUNNEL_MAX_LENGTH) { plan.problem = "too long"; return plan; }
+    // Only the two MOUTHS need open ground — everything in between is
+    // exactly what the belt is going under, so it isn't checked.
+    if (world[plan.ax][plan.ay].type != TILE_GRASS ||
+        world[plan.bx][plan.by].type != TILE_GRASS) {
+        plan.problem = "both ends need open ground";
+        return plan;
+    }
+    Rectangle inRec  = { (float)(plan.ax * TILE_SIZE), (float)(plan.ay * TILE_SIZE),
+                         (float)TILE_SIZE, (float)TILE_SIZE };
+    Rectangle outRec = { (float)(plan.bx * TILE_SIZE), (float)(plan.by * TILE_SIZE),
+                         (float)TILE_SIZE, (float)TILE_SIZE };
+    if (CheckCollisionCircleRec(player.pos, PLAYER_RADIUS + 1.0f, inRec) ||
+        CheckCollisionCircleRec(player.pos, PLAYER_RADIUS + 1.0f, outRec)) {
+        plan.problem = "you're standing on an end";
+        return plan;
+    }
+    // The price: one belt per tile it spans. A twenty-tile tunnel
+    // costs twenty belts, same as laying twenty on the surface would.
+    if (player.inventory[ITEM_TUNNEL] < plan.length) {
+        plan.problem = TextFormat("need %d belts, have %d",
+                                  plan.length, player.inventory[ITEM_TUNNEL]);
+        return plan;
+    }
+    plan.valid = true;
+    return plan;
+}
+
+// Build the run the plan describes. Both mouths are claimed BEFORE
+// either tile is changed: half a tunnel is not a thing we ever want
+// to leave lying in someone's base because the pool filled up.
+static bool TunnelBuild(const TunnelPlan *plan) {
+    if (!plan->valid) return false;
+    Machine *in  = AddMachineAt(plan->ax, plan->ay, TILE_TUNNEL_IN,  plan->dir);
+    if (in == NULL) return false;
+    Machine *out = AddMachineAt(plan->bx, plan->by, TILE_TUNNEL_OUT, plan->dir);
+    if (out == NULL) { in->active = false; machineIndex[plan->ax][plan->ay] = -1; return false; }
+
+    in->linkX  = plan->bx; in->linkY  = plan->by;
+    out->linkX = plan->ax; out->linkY = plan->ay;
+    WorldSetTile(plan->ax, plan->ay, TILE_TUNNEL_IN);
+    WorldSetTile(plan->bx, plan->by, TILE_TUNNEL_OUT);
+    PlayerRemoveItem(&player, ITEM_TUNNEL, plan->length);
+    return true;
+}
+
+// Press to anchor, drag to aim, release to lay. Returns true when it
+// has claimed the click, which is how it keeps the ordinary
+// build-and-mine path from also firing.
+static void UpdateTunnelTool(Vector2 mouseWorld, bool anchorInReach) {
+    if (!tunnelDragging) {
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && anchorInReach) {
+            tunnelAnchorX = (int)(mouseWorld.x / TILE_SIZE);
+            tunnelAnchorY = (int)(mouseWorld.y / TILE_SIZE);
+            tunnelDragging = true;
+        }
+        return;
+    }
+    // A right-click mid-drag throws the run away — the standard
+    // "no, not that" gesture, and cheaper than undoing a bad build.
+    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        tunnelDragging = false;
+        return;
+    }
+    if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        TunnelPlan plan = TunnelPlanFor(tunnelAnchorX, tunnelAnchorY, mouseWorld);
+        TunnelBuild(&plan);          // an invalid plan simply builds nothing
+        tunnelDragging = false;
+    }
+}
+
 // ─── Mouse actions in the world: mine, place, shoot ──────────
 static void UpdateMiningAndPlacing(float dt) {
     // Mouse over the hotbar? That click belongs to the UI — don't
@@ -477,8 +801,8 @@ static void UpdateMiningAndPlacing(float dt) {
             PlayerToggleTechMenu(&player);
             return;
         }
-        // Chest, drill, inserter, belt → open its panel.
-        if (hoverTile == TILE_CHEST || TileNeedsFuel(hoverTile) || TileIsBelt(hoverTile)) {
+        // Chest, drill, inserter, belt, splitter, tunnel → its panel.
+        if (hoverTile == TILE_CHEST || TileNeedsFuel(hoverTile) || TileIsBeltLike(hoverTile)) {
             if (MachineAt(tx, ty) != NULL) {
                 if (machineUiX == tx && machineUiY == ty) {
                     machineUiX = machineUiY = -1;    // same tile → close
@@ -573,6 +897,17 @@ static void UpdateMiningAndPlacing(float dt) {
         return;   // holding a weapon: no mining/placing with this click
     }
 
+    // ── The underground belt gets its own tool ────────────────
+    // It's the one build that isn't "click a tile", so it's handled
+    // before the ordinary place/mine path and swallows the click.
+    // Only the ANCHOR has to be within arm's reach: once the near end
+    // is planted, the far end is projected out along the line, which
+    // is what "any length" has to mean to be worth having.
+    if (held == ITEM_TUNNEL) {
+        UpdateTunnelTool(mouse, inReach);
+        return;
+    }
+
     // ── Everything below (mine, place) needs REACH ────────────
     if (!inReach) return;
 
@@ -651,6 +986,57 @@ static void UpdateMiningAndPlacing(float dt) {
 // translucent preview of what you're about to build, with its
 // facing arrow — so belts and inserters show which way they'll run
 // BEFORE you commit. Click (RMB) is what actually places it.
+// ─── The neon line ───────────────────────────────────────────
+// The underground belt's preview. It has to carry three facts at a
+// glance — where it starts, where it surfaces, and what it costs —
+// because none of them are visible once the thing is buried. Hence
+// neon: a glow, a bright core, a pip travelling the line to show the
+// direction, boxed ends, and the price in tiles. Green means the
+// release will build it; red means it won't, and says why.
+static void DrawTunnelNeon(Vector2 mouse) {
+    TunnelPlan plan = TunnelPlanFor(tunnelAnchorX, tunnelAnchorY, mouse);
+
+    Vector2 a = { (plan.ax + 0.5f) * TILE_SIZE, (plan.ay + 0.5f) * TILE_SIZE };
+    Vector2 b = { (plan.bx + 0.5f) * TILE_SIZE, (plan.by + 0.5f) * TILE_SIZE };
+    Color glow = plan.valid ? (Color){  60, 255, 190,  60 } : (Color){ 255,  70,  70,  60 };
+    Color core = plan.valid ? (Color){ 180, 255, 235, 230 } : (Color){ 255, 150, 150, 230 };
+
+    // Three passes, fat to thin: that stack is what reads as "lit"
+    // rather than "a line someone drew".
+    DrawLineEx(a, b, 14.0f, glow);
+    DrawLineEx(a, b, 6.0f, (Color){ glow.r, glow.g, glow.b, 110 });
+    DrawLineEx(a, b, 2.0f, core);
+
+    // Tick per buried tile, and one pip crawling the length so the
+    // direction of travel is never in doubt.
+    float crawl = fmodf((float)GetTime() * 1.1f, 1.0f);
+    for (int i = 0; i < plan.length; i++) {
+        float f = (plan.length > 1) ? (float)i / (plan.length - 1) : 0.0f;
+        Vector2 at = { a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f };
+        bool head = fabsf(f - crawl) < 0.6f / plan.length;
+        DrawCircleV(at, head ? 4.0f : 2.0f, head ? core : (Color){ core.r, core.g, core.b, 120 });
+    }
+
+    // The two mouths, boxed.
+    for (int end = 0; end < 2; end++) {
+        int ex = end ? plan.bx : plan.ax, ey = end ? plan.by : plan.ay;
+        Rectangle r = { (float)(ex * TILE_SIZE), (float)(ey * TILE_SIZE),
+                        (float)TILE_SIZE, (float)TILE_SIZE };
+        DrawRectangleRec(r, (Color){ glow.r, glow.g, glow.b, 70 });
+        DrawRectangleLinesEx(r, 2, core);
+        DrawItemSprite(ITEM_TUNNEL, r.x + 4, r.y + 4, TILE_SIZE - 8);
+    }
+
+    // The readout, floating over the far end: cost, or the reason.
+    const char *label = plan.valid
+        ? TextFormat("%d tiles   %d belts", plan.length, plan.length)
+        : TextFormat("%d tiles   %s", plan.length, plan.problem);
+    int tw = MeasureText(label, 12);
+    DrawRectangle((int)b.x - tw / 2 - 5, (int)b.y - TILE_SIZE - 4, tw + 10, 17,
+                  (Color){ 8, 12, 16, 220 });
+    DrawText(label, (int)b.x - tw / 2, (int)b.y - TILE_SIZE - 1, 12, core);
+}
+
 static void DrawPlacementGhost(void) {
     ItemID held = player.selected;
     if (held == ITEM_NONE || !ITEMS[held].placeable) return;
@@ -659,6 +1045,30 @@ static void DrawPlacementGhost(void) {
     Vector2 mouse = GetScreenToWorld2D(GetMousePosition(), camera);
     int tx = (int)(mouse.x / TILE_SIZE), ty = (int)(mouse.y / TILE_SIZE);
     if (tx < 0 || tx >= WORLD_SIZE || ty < 0 || ty >= WORLD_SIZE) return;
+
+    // The underground belt draws its own thing entirely: mid-drag it's
+    // the neon run, and before that just a hint of where it'd start.
+    if (held == ITEM_TUNNEL) {
+        if (tunnelDragging) {
+            DrawTunnelNeon(mouse);
+        } else {
+            Rectangle r = { (float)(tx * TILE_SIZE), (float)(ty * TILE_SIZE),
+                            (float)TILE_SIZE, (float)TILE_SIZE };
+            bool ok = (world[tx][ty].type == TILE_GRASS) &&
+                      Vector2Distance(player.pos, mouse) <= TUNE.playerReach;
+            Color tint = ok ? (Color){ 60, 255, 190, 70 } : (Color){ 255, 90, 90, 70 };
+            DrawRectangleRec(r, tint);
+            DrawRectangleLinesEx(r, 2, ok ? (Color){ 180, 255, 235, 220 }
+                                          : (Color){ 255, 120, 120, 220 });
+            DrawItemSprite(ITEM_TUNNEL, r.x + 3, r.y + 3, TILE_SIZE - 6);
+            if (ok) {
+                const char *hint = "drag to lay the run";
+                DrawText(hint, (int)r.x - MeasureText(hint, 11) / 2 + TILE_SIZE / 2,
+                         (int)r.y - 14, 11, (Color){ 180, 255, 235, 220 });
+            }
+        }
+        return;
+    }
 
     float px = (float)(tx * TILE_SIZE), py = (float)(ty * TILE_SIZE);
     Rectangle tile = { px, py, (float)TILE_SIZE, (float)TILE_SIZE };
@@ -701,6 +1111,50 @@ static Vector2 PlayerDropSpot(void) {
     return spot;
 }
 
+// ─── The filter picker's clicks ──────────────────────────────
+// MODAL, unlike every other panel in the game: while the item grid
+// is up it owns the mouse, because the only thing you can sensibly
+// do with it open is pick an item or leave. Escape is handled by the
+// dismissal chain in UpdateGame, one level up.
+static void UpdateFilterPicker(void) {
+    Machine *m = MachineAt(machineUiX, machineUiY);
+    if (m == NULL || !TileHasFilter(m->type)) {
+        machineFilterPickerOpen = false;
+        return;
+    }
+    FilterPickerLayout l = { 0 };
+    UiGetFilterPickerLayout(&l);
+    Vector2 mp = GetMousePosition();
+    Rectangle panel = { (float)l.x, (float)l.y, (float)l.w, (float)l.h };
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        machineFilterPickerOpen = false;
+        return;
+    }
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+
+    // The [X], or anywhere outside the panel: leave it as it was.
+    if (CheckCollisionPointRec(mp, UiPanelCloseRect(l.x, l.y, l.w)) ||
+        !CheckCollisionPointRec(mp, panel)) {
+        machineFilterPickerOpen = false;
+        return;
+    }
+    if (CheckCollisionPointRec(mp, l.clearRect)) {
+        m->filter = ITEM_NONE;
+        machineFilterPickerOpen = false;
+        return;
+    }
+    for (int i = 0; i < l.count; i++) {
+        Rectangle r = UiFilterCellRect(&l, i);
+        if (r.y + r.height > l.clearRect.y - 6) break;   // same cut-off ui.h draws
+        if (CheckCollisionPointRec(mp, r)) {
+            m->filter = UiFilterItemAt(i);
+            machineFilterPickerOpen = false;
+            return;
+        }
+    }
+}
+
 // ─── One frame of gameplay ───────────────────────────────────
 // DESIGN CHANGE — menus no longer pause the world. Mobs keep
 // marching while you dig through your backpack (rust-like: the
@@ -727,10 +1181,17 @@ static void UpdateGame(float dt) {
         PlayerQuickWeapon(&player);
     }
 
+    // A panel that closed takes its filter picker with it.
+    if (machineUiX < 0) machineFilterPickerOpen = false;
+
     // Escape: close whatever is open; with nothing open, pause.
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (debugMenuOpen) {
             debugMenuOpen = false;
+        } else if (machineFilterPickerOpen) {
+            machineFilterPickerOpen = false;
+        } else if (tunnelDragging) {
+            tunnelDragging = false;      // abandon the run being drawn
         } else if (machineUiX >= 0) {
             machineUiX = machineUiY = -1;
         } else if (player.inventoryOpen || player.craftMenuOpen || player.techMenuOpen) {
@@ -752,7 +1213,10 @@ static void UpdateGame(float dt) {
     // stack up on press, drop it wherever you release. Each surface
     // is hit-tested through the same rect function the drawing uses,
     // so click targets can never drift from pixels.
-    {
+    // (Skipped entirely while the filter picker is up — it's modal.)
+    if (machineFilterPickerOpen) {
+        UpdateFilterPicker();
+    } else {
         Vector2 mouse = GetMousePosition();   // menus live in SCREEN space
         bool panelsOpen = player.inventoryOpen || machineUiX >= 0;
 
@@ -913,7 +1377,7 @@ static void UpdateGame(float dt) {
     }
 
     // ── Craft menu ───────────────────────────────────────────
-    if (player.craftMenuOpen) {
+    if (player.craftMenuOpen && !machineFilterPickerOpen) {
         CraftLayout craftLayout = { 0 };
         UiGetCraftLayout(&player, &craftLayout);
         int n = CraftableCount();
@@ -1028,7 +1492,7 @@ static void UpdateGame(float dt) {
     }
 
     // ── Tech tree (RMB a Research Computer to open) ──────────
-    if (player.techMenuOpen) {
+    if (player.techMenuOpen && !machineFilterPickerOpen) {
         TechLayout techLayout = { 0 };
         UiGetTechLayout(&techLayout);
         int total = TECH_COUNT - 1;
@@ -1086,7 +1550,8 @@ static void UpdateGame(float dt) {
 
     // Craft-queue [x] buttons: cancel and refund that entry. Checked
     // before world clicks so the button always wins.
-    if (player.craftQueueCount > 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+    if (player.craftQueueCount > 0 && !machineFilterPickerOpen &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         int shown = player.craftQueueCount < UI_QUEUE_MAX_SHOWN
                   ? player.craftQueueCount : UI_QUEUE_MAX_SHOWN;
         for (int i = 0; i < shown; i++) {
@@ -1111,14 +1576,25 @@ static void UpdateGame(float dt) {
     // Click a slot to move a stack: full slot + empty hand takes it
     // out, held item + slot puts it in. Clicking the coal slot with
     // coal in hand tops the hopper right up.
-    if (machineUiX >= 0 && machineUiY >= 0) {
+    if (machineUiX >= 0 && machineUiY >= 0 && !machineFilterPickerOpen) {
         Machine *m = MachineAt(machineUiX, machineUiY);
         // Right-click closes the panel again (the same button that
         // opened it), since world interaction is suppressed while
-        // it's up. Escape works too.
-        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        // it's up. Escape works too. The ONE exception is the filter
+        // slot: right-clicking that clears the rule, which is the
+        // gesture you'd reach for anyway.
+        if (m != NULL && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            MachinePanelLayout ml = { 0 };
+            UiGetMachinePanelLayout(&player, m, &ml);
+            if (ml.hasFilter &&
+                CheckCollisionPointRec(GetMousePosition(), ml.filterRect)) {
+                m->filter = ITEM_NONE;
+            } else {
+                machineUiX = machineUiY = -1;
+                m = NULL;
+            }
+        } else if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
             machineUiX = machineUiY = -1;
-            m = NULL;
         }
         if (m == NULL) {
             machineUiX = machineUiY = -1;
@@ -1145,6 +1621,10 @@ static void UpdateGame(float dt) {
                     m->coal = 0;
                 }
             }
+            // The filter slot opens the item grid.
+            if (m != NULL && ml.hasFilter && CheckCollisionPointRec(mp, ml.filterRect)) {
+                machineFilterPickerOpen = true;
+            }
         }
     }
 
@@ -1164,7 +1644,7 @@ static void UpdateGame(float dt) {
             int htx = (int)(mw.x / TILE_SIZE), hty = (int)(mw.y / TILE_SIZE);
             Machine *hovered = NULL;
             if (htx >= 0 && htx < WORLD_SIZE && hty >= 0 && hty < WORLD_SIZE &&
-                TileIsDirectional(world[htx][hty].type)) {
+                TileIsRotatable(world[htx][hty].type)) {
                 hovered = MachineAt(htx, hty);
             }
             if (ItemIsWeapon(player.selected)) {
@@ -1213,13 +1693,24 @@ static void UpdateGame(float dt) {
             }
         }
 
-        // Quick save/load hotkeys.
-        if (IsKeyPressed(KEY_F5)) GameSave();
+        // Quick save/load hotkeys. With no slot attached, F5 sends
+        // you to the grid to choose one — same rule as the menu.
+        if (IsKeyPressed(KEY_F5) && !GameSave()) OpenSavesScreen(true, SCREEN_GAME);
         if (IsKeyPressed(KEY_F9)) GameLoad();
 
         // Holding G shows the world map — mouse clicks belong to
         // the map then, not to mining/shooting under the overlay.
         if (!IsKeyDown(KEY_G)) UpdateMiningAndPlacing(dt);
+    }
+
+    // A tunnel drag can be abandoned in ways the tool never sees: you
+    // let go over the hotbar, you swap items, a menu opens. None of
+    // those should leave a half-drawn run waiting to spring back to
+    // life later, so the flag is only allowed to survive while the
+    // button is genuinely still down with the belt still in hand.
+    if (tunnelDragging && (anyMenu || player.selected != ITEM_TUNNEL ||
+                           !IsMouseButtonDown(MOUSE_BUTTON_LEFT))) {
+        tunnelDragging = false;
     }
 
     // ── The simulation ALWAYS runs — menus don't pause the world.
@@ -1305,6 +1796,7 @@ static void DrawGame(void) {
     UiDrawCraftMenu(&player);
     UiDrawMachinePanel(&player);   // chest / drill / inserter / belt
     UiDrawTechMenu(&player);
+    UiDrawFilterPicker();       // the item grid, over the panel it edits
     UiDrawDragGhost();          // the stack riding the cursor
     DebugMenuDraw(&player);     // F3 console — always on top of the rest
 }
@@ -1341,13 +1833,19 @@ static void UpdatePause(void) {
         return;
     }
 
+    // SAVE writes to the slot this playthrough belongs to. A world
+    // with no slot yet (every slot was full when it started) sends
+    // you to the saves screen to pick one instead of failing quietly.
     if (UiButtonUpdate(&pauseSaveButton)) {
-        GameSave();
+        if (!GameSave()) OpenSavesScreen(true, SCREEN_PAUSE);
+        return;
     }
 
+    // LOAD opens the saves grid rather than silently reloading — with
+    // eight worlds on disk, "load" is a question, not a command.
     if (UiButtonUpdate(&pauseLoadButton)) {
-        GameLoad();
-        screen = SCREEN_GAME;   // jump straight back into the loaded game
+        OpenSavesScreen(false, SCREEN_PAUSE);
+        return;
     }
 
     if (UiButtonUpdate(&pauseSettingsButton)) {
@@ -1428,24 +1926,32 @@ static void DrawSettings(void) {
 static void LayoutTitleButtons(void) {
     int cx = GetScreenWidth() / 2;
     int cy = GetScreenHeight() / 2;
-    titleStartButton.rect    = (Rectangle){ cx - 110, cy + 90, 220, 56 };
-    titleStartButton.text    = "NEW GAME";
-    titleContinueButton.rect = (Rectangle){ cx - 110, cy + 20, 220, 56 };
-    titleContinueButton.text = "CONTINUE";
-    titleQuitButton.rect     = (Rectangle){ cx - 110, cy + 160, 220, 56 };
-    titleQuitButton.text     = "QUIT";
+    titleStartButton.rect = (Rectangle){ cx - 110, cy + 90, 220, 56 };
+    titleStartButton.text = "NEW GAME";
+    titleSavesButton.rect = (Rectangle){ cx - 110, cy + 20, 220, 56 };
+    titleSavesButton.text = "SAVES";
+    titleQuitButton.rect  = (Rectangle){ cx - 110, cy + 160, 220, 56 };
+    titleQuitButton.text  = "QUIT";
+}
+
+// Start a fresh world in the first free slot. If all eight are taken
+// the world still starts — it just isn't attached anywhere yet, and
+// the first SAVE will ask where to put it. Landing on top of an
+// existing world without being asked is never an option.
+static void StartNewGameInFreeSlot(void) {
+    int slot = SaveFirstEmptySlot(SAVE_VERSION);
+    NewGame();
+    saveSlotActive = -1;
+    if (slot >= 0) GameSaveTo(slot);
+    screen = SCREEN_GAME;
 }
 
 static void UpdateTitle(void) {
     LayoutTitleButtons();
 
-    // Only offer CONTINUE if a save file actually exists on disk.
-    bool hasSave = WorldHasSave();
-
     // Enter/Space = keyboard shortcut for NEW GAME.
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE)) {
-        NewGame();
-        screen = SCREEN_GAME;
+        StartNewGameInFreeSlot();
         return;
     }
 
@@ -1461,17 +1967,15 @@ static void UpdateTitle(void) {
         return;
     }
 
-    // CONTINUE: try to load; if the file is corrupt or unreadable,
-    // fall back to a new game rather than crashing or doing nothing.
-    if (hasSave && UiButtonUpdate(&titleContinueButton)) {
-        if (!GameLoad()) NewGame();
-        screen = SCREEN_GAME_SAVES;
+    // SAVES: the grid of worlds. Always available — an empty grid is
+    // still worth seeing, because it's where NEW GAME's world will go.
+    if (UiButtonUpdate(&titleSavesButton)) {
+        OpenSavesScreen(false, SCREEN_TITLE);
         return;
     }
 
     if (UiButtonUpdate(&titleStartButton)) {
-        NewGame();
-        screen = SCREEN_GAME;
+        StartNewGameInFreeSlot();
     }
 }
 
@@ -1488,14 +1992,9 @@ static void DrawTitle(void) {
              cx - MeasureText("VOID RUNNER", 24)/2 - 22, cy - 100, 30, GRAY);
 
     LayoutTitleButtons();
+    UiDrawButton(&titleSavesButton);
     UiDrawButton(&titleStartButton);
     UiDrawButton(&titleQuitButton);
-
-    // CONTINUE is drawn only when there's a save — matching the
-    // click logic in UpdateTitle so you can't click an invisible button.
-    if (WorldHasSave()) {
-        UiDrawButton(&titleContinueButton);
-    }
 }
 
 // ─── Entry point ─────────────────────────────────────────────
@@ -1520,18 +2019,20 @@ int main(void) {
         float dt = GetFrameTime();   // seconds since last frame ("delta time")
 
         // 1) UPDATE — route input to whichever screen is active.
-        if      (screen == SCREEN_TITLE)    UpdateTitle();
-        else if (screen == SCREEN_PAUSE)    UpdatePause();
-        else if (screen == SCREEN_SETTINGS) UpdateSettings();
-        else                                UpdateGame(dt);
+        if      (screen == SCREEN_TITLE)      UpdateTitle();
+        else if (screen == SCREEN_PAUSE)      UpdatePause();
+        else if (screen == SCREEN_SETTINGS)   UpdateSettings();
+        else if (screen == SCREEN_GAME_SAVES) UpdateGameSaves();
+        else                                  UpdateGame(dt);
 
         // 2) DRAW — raylib requires all drawing between Begin/EndDrawing.
         BeginDrawing();
             ClearBackground(BLACK);  // wipe last frame or you get smearing
-            if      (screen == SCREEN_TITLE)    DrawTitle();
-            else if (screen == SCREEN_PAUSE)    DrawPause();
-            else if (screen == SCREEN_SETTINGS) DrawSettings();
-            else                                DrawGame();
+            if      (screen == SCREEN_TITLE)      DrawTitle();
+            else if (screen == SCREEN_PAUSE)      DrawPause();
+            else if (screen == SCREEN_SETTINGS)   DrawSettings();
+            else if (screen == SCREEN_GAME_SAVES) DrawGameSaves();
+            else                                  DrawGame();
             DrawFPS(10, GetScreenHeight() - 25);  // little debug counter
         EndDrawing();  // presents the finished frame and waits for vsync
     }

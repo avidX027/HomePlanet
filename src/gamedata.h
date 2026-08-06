@@ -44,6 +44,12 @@ typedef enum {
     TILE_SPAWNER,       // mob nest — generated at the map edges
     TILE_QUICKSAND,     // walkable, but it drags at you and then swallows
     TILE_VOID,          // outside the active map: the edge of the world
+    // NEW ROWS GO AT THE END. A tile's number is what a save file
+    // stores, so inserting one in the middle would turn every saved
+    // chest into a drill.
+    TILE_SPLITTER,      // 2-way belt junction: feeds left AND right
+    TILE_TUNNEL_IN,     // underground belt: the mouth items go down
+    TILE_TUNNEL_OUT,    // ...and the mouth they come back up from
     TILE_COUNT
 } TileType;
 
@@ -84,6 +90,9 @@ typedef enum {
     ITEM_CHITIN,          // cut from the natives; the only source
     ITEM_GEM_PICK,        // gem-tipped pick: the early-game power spike
     ITEM_GEM_CHARM,       // worn in the pack: you heal much faster
+    // Same rule as the tiles: append only, never insert.
+    ITEM_SPLITTER,        // places TILE_SPLITTER (R rotates)
+    ITEM_TUNNEL,          // the underground belt — laid as a DRAGGED line
     ITEM_COUNT
 } ItemID;
 
@@ -215,6 +224,11 @@ static ItemInfo ITEMS[ITEM_COUNT] = {
     [ITEM_CHITIN]       = { "Chitin",      (Color){160, 90,150,255},  0, TILE_GRASS, false,     ITEM_NONE,       0, ITEM_NONE,    0, 0 },
     [ITEM_GEM_PICK]     = { "Gem Pick",    (Color){120,215,245,255}, 13, TILE_GRASS, false,     ITEM_GEM,        2, ITEM_WOOD,    3, 1, TECH_NONE,       CAT_TOOLS },
     [ITEM_GEM_CHARM]    = { "Gem Charm",   (Color){ 90,235,215,255},  0, TILE_GRASS, false,     ITEM_GEM,        3, ITEM_CHITIN,  2, 1, TECH_NONE,       CAT_TOOLS },
+    [ITEM_SPLITTER]     = { "Splitter",    (Color){210,140, 70,255}, 0,  TILE_SPLITTER, true,   ITEM_METAL,      4, ITEM_RUBBER,  2, 1, TECH_LOGISTICS,  CAT_LOGISTICS },
+    // The underground belt is priced PER TILE: laying a tunnel eats
+    // one of these for every tile it spans, so a long run costs a long
+    // run's worth of belt. (See the drag-placement tool in main.c.)
+    [ITEM_TUNNEL]       = { "Underground Belt", (Color){130,120,200,255}, 0, TILE_TUNNEL_IN, true, ITEM_METAL,   3, ITEM_RUBBER,  1, 2, TECH_LOGISTICS,  CAT_LOGISTICS },
 };
 
 typedef struct {
@@ -257,6 +271,12 @@ static TileInfo TILES[TILE_COUNT] = {
     // The hard edge of the ACTIVE map (see worldSize). Unbreakable,
     // unwalkable, and drawn as starfield — you simply can't go there.
     [TILE_VOID]         = { "The Void",      (Color){  6,  6, 12,255},  1,   ITEM_NONE,             0, false, false },
+    // Belt furniture. The tunnel mouths drop NOTHING from this table
+    // on purpose: mining one refunds the whole run, which only the
+    // machine record knows the length of (see RemoveMachineAt).
+    [TILE_SPLITTER]     = { "Splitter",      (Color){ 96, 76, 46,255},  6,   ITEM_SPLITTER,         1, true,  true  },
+    [TILE_TUNNEL_IN]    = { "Belt Entrance", (Color){ 62, 58, 92,255},  8,   ITEM_NONE,             0, true,  false },
+    [TILE_TUNNEL_OUT]   = { "Belt Exit",     (Color){ 62, 58, 92,255},  8,   ITEM_NONE,             0, true,  false },
 };
 
 // ─── Tile break loot ──────────────────────────────────────
@@ -625,6 +645,24 @@ static const ItemArt ITEM_ART[ITEM_COUNT] = {
         "owbbdbwo",
         "oddddddo",
         "oooooooo" } },
+    [ITEM_SPLITTER] = { { 176, 156, 60, 255 }, {  // one lane in, two out
+        "oooooooo",
+        "obbbbbdo",
+        "ossoossd",
+        "o.so.s.o",
+        "o.so.s.o",
+        "ossoossd",
+        "obbbbbdo",
+        "oooooooo" } },
+    [ITEM_TUNNEL] = { { 176, 156, 60, 255 }, {  // a belt diving into a ramp
+        "oooooooo",
+        "osssssso",
+        "obbbbbbo",
+        "oodddd.o",
+        "ooodd.oo",
+        "oooddooo",
+        "ooodoooo",
+        "oooooooo" } },
     [ITEM_DOOR] = { { 90, 60, 35, 255 }, {      // planked door + handle
         ".oooooo.",
         "obbobbdo",
@@ -862,6 +900,11 @@ static float TileServiceLife(TileType t) {
         case TILE_INSERTER:     return 7200.0f;   // arms are simple, they last
         case TILE_CONVEYOR:
         case TILE_CONVEYOR_CORNER: return 9000.0f;
+        case TILE_SPLITTER:     return 8000.0f;   // more moving parts than a belt
+        // Buried belt is out of the weather; it simply outlasts
+        // everything else on the surface.
+        case TILE_TUNNEL_IN:
+        case TILE_TUNNEL_OUT:   return 0.0f;
         case TILE_TURRET:       return 3600.0f;   // guns wear out fastest
         case TILE_LASER_TURRET: return 4800.0f;
         default:                return 0.0f;      // 0 = never wears out
@@ -875,10 +918,26 @@ static bool TileIsBelt(TileType t) {
     return t == TILE_CONVEYOR || t == TILE_CONVEYOR_CORNER;
 }
 
+// The two mouths of an underground belt. They come in linked PAIRS —
+// entrance and exit remember each other's coordinates, which is what
+// lets the run be any length at all.
+static bool TileIsTunnel(TileType t) {
+    return t == TILE_TUNNEL_IN || t == TILE_TUNNEL_OUT;
+}
+
+// "Belt-like" = anything that ferries cargo through slot 0 and hands
+// it on: the two belt pieces, the splitter, and both tunnel mouths.
+// Every place that used to ask "is this a belt?" before accepting or
+// taking an item asks THIS instead, so a new piece of belt furniture
+// works with drills, arms and other belts the day it's added.
+static bool TileIsBeltLike(TileType t) {
+    return TileIsBelt(t) || t == TILE_SPLITTER || TileIsTunnel(t);
+}
+
 // Machines that hold state, burn fuel, or store items — i.e. the
 // ones that get a Machine record and a UI.
 static bool TileIsMachine(TileType t) {
-    return t == TILE_CHEST || t == TILE_DRILL || TileIsBelt(t) ||
+    return t == TILE_CHEST || t == TILE_DRILL || TileIsBeltLike(t) ||
            t == TILE_INSERTER || t == TILE_TURRET || t == TILE_LASER_TURRET ||
            t == TILE_RESEARCH;
 }
@@ -886,8 +945,22 @@ static bool TileIsMachine(TileType t) {
 // Machines whose facing matters — R rotates these in place.
 // Drills are directional too: they spit their output onto whatever
 // sits in FRONT of them, so a drill can feed a belt with no arm.
+// (Tunnel mouths are directional but NOT rotatable: their facing is
+// decided by the line you dragged, and spinning one would strand its
+// partner. TileIsRotatable is what R actually asks.)
 static bool TileIsDirectional(TileType t) {
-    return TileIsBelt(t) || t == TILE_INSERTER || t == TILE_DRILL;
+    return TileIsBeltLike(t) || t == TILE_INSERTER || t == TILE_DRILL;
+}
+
+static bool TileIsRotatable(TileType t) {
+    return TileIsDirectional(t) && !TileIsTunnel(t);
+}
+
+// Machines that sort their cargo by ITEM: an inserter only grabs its
+// filtered item, a splitter sends it down one branch. ITEM_NONE in
+// the machine's `filter` field means "no filter, take anything".
+static bool TileHasFilter(TileType t) {
+    return t == TILE_INSERTER || t == TILE_SPLITTER;
 }
 
 // Machines that run on coal.

@@ -4,6 +4,9 @@ bin/
 *.o
 *.dSYM/
 
+# Saved worlds — eight slots at ~10MB each is not source
+saves/
+
 # OS junk
 .DS_Store
 Thumbs.db

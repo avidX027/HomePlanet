@@ -19,7 +19,8 @@ base looks edible.
 HomePlanet/
 ├── README.md
 ├── Makefile             # cross-platform build (macOS + Windows)
-├── homeplanet.sav       # your world (F5 saves, F9 loads)
+├── saves/               # your worlds — eight slots (git-ignored)
+│   └── slot0.sav …
 ├── .vscode/             # tasks.json (build) + launch.json (F5 debug)
 └── src/
     ├── config.h         # every tweakable number: speeds, sizes, colors
@@ -27,6 +28,7 @@ HomePlanet/
     ├── world.h          # the tile grid: biomes, generation, drawing, damage, fog
     ├── player.h         # movement, inventory, craft queue, research state
     ├── entities.h       # everything that MOVES: machines, mobs, bots, bullets
+    ├── saves.h          # the save slots: names, dates, previews
     ├── ui.h             # hotbar, backpack, craft grid, block panels (screen space)
     ├── debug.h          # the F3 live-tuning console
     └── main.c           # game loop + input; the only file where they all meet
@@ -91,6 +93,8 @@ in-game under **Settings → Controls**.
 | W A S D | Move (works with menus open) |
 | Left click | Build (holding a block) / mine / shoot |
 | Right click | Open block panels; in crafting, craft 5 |
+| Drag (belt) | Underground belt: drag out the run, release to lay |
+| Filter slot | Inserter / splitter: click to pick an item, RMB clears |
 | Q | Close menus, draw / cycle weapons |
 | Z (drag) | Feed coal to drills / inserters |
 | F (hold) | Pull items off nearby belts |
@@ -104,7 +108,7 @@ in-game under **Settings → Controls**.
 | R | Reload gun; else rotate belt/arm or ghost |
 | G (hold) | World map |
 | F3 | Debug console |
-| F5 / F9 | Quick save / quick load |
+| F5 / F9 | Quick save / quick load (the slot you're playing) |
 | ESC | Close menu / pause |
 
 ---
@@ -137,6 +141,8 @@ Nothing crafts instantly: every recipe takes real seconds and goes through a
 |---------|--------------|
 | Mining Drill | Auto-mines the tile in front of it; burns coal |
 | Conveyor / Belt Corner | Moves items — and drags *you* if you stand on one |
+| Splitter | One lane in, two out: alternates left and right |
+| Underground Belt | A buried run of any length; costs one belt per tile |
 | Inserter | Robotic hand: moves items between neighbors; burns coal |
 | Chest | 49 slots of storage |
 | Mining Bot | Autonomous drone that flies out and digs on its own |
@@ -144,10 +150,62 @@ Nothing crafts instantly: every recipe takes real seconds and goes through a
 | Laser Turret | Zaps mobs; no ammo, slower |
 | Research Computer | Opens the tech tree |
 
-Belts, corners, inserters, and drills are **directional** — `R` rotates them in
-place. Drills spit output onto whatever sits in front of them, so a drill can
-feed a belt with no inserter at all. Coal is the fuel economy: rocks drop it
-generously because every drill and inserter eats it.
+Belts, corners, splitters, inserters, and drills are **directional** — `R`
+rotates them in place. Drills spit output onto whatever sits in front of them,
+so a drill can feed a belt with no inserter at all. Coal is the fuel economy:
+rocks drop it generously because every drill and inserter eats it.
+
+#### Filters
+
+Inserters and splitters both have a **filter**: open the machine's panel and
+click the filter slot to get a grid of every item in the game (which, since
+anything can ride a belt, is exactly the list worth sorting for). Right-click
+the slot to clear it.
+
+* A **filtered inserter** only ever picks up that one item — so an arm can hunt
+  coal out of a chest full of ore instead of jamming with cargo the destination
+  won't take.
+* A **filtered splitter** stops alternating and starts sorting: matches go out
+  the left mouth, everything else out the right. A filtered item waits for its
+  own lane rather than escaping down the wrong one.
+
+The chosen item is drawn small in the machine's top-left corner, so a filtered
+line is readable from the factory floor without opening anything.
+
+#### Underground belts
+
+The underground belt has **no length limit**. It isn't placed a tile at a time
+— press the mouse on the tile the run should start at, drag out to where it
+should surface, and release. While you drag, a neon line shows the exact run:
+its two mouths, a pip crawling the length to show which way cargo travels, and
+the price. It costs **one belt per tile it spans**, so a twenty-tile tunnel
+costs twenty, the same as laying twenty on the surface would.
+
+Only the two mouths need open ground; everything between them is what the belt
+is going under. Mining either mouth pulls the whole run up and refunds every
+tile of it — half a tunnel is not a thing you can own. A faint dotted line
+between linked mouths keeps a buried base readable.
+
+### Saved worlds
+
+The title screen's **SAVES** button opens a grid of eight slots. Each occupied
+slot is a card showing a **preview** — a thumbnail of the map around where you
+were standing, so worlds tell themselves apart at a glance — plus the date it
+was last written and how long it's been played.
+
+* **Click a card** to play that world.
+* **Click its name** to rename it; Enter keeps the change, Escape throws it
+  away. A rename rewrites only the file's header, not the whole 10MB world.
+* **Click the x** to delete — twice. The first click arms it and says so; the
+  second does it. There is no undo for a deleted world, so it costs two.
+* **Click an empty slot** to start a fresh world there.
+
+**NEW GAME** starts in the first free slot. If all eight are taken the world
+still starts, it just isn't attached to a slot yet, and the first save sends
+you to the grid to pick one — nothing is ever written over without a click.
+
+Save metadata lives in the file's header, so the screen describes eight worlds
+by reading a few KB each instead of loading eight full maps.
 
 ### The natives
 
@@ -235,8 +293,9 @@ plastics. Scaled crafting: bigger recipes yield more powerful versions (laser
 modules S/M/L). Components (gears, bearings) as sub-parts of placeables rather
 than standalone items.
 
-**Logistics:** pipes and fluids, underground belts, splitters and mergers,
-3D printers, logistics bots with a request network.
+**Logistics:** pipes and fluids, mergers, 3D printers, logistics bots with a
+request network. *(Underground belts and splitters have landed — see
+Automation.)*
 
 **Power:** solar → capacitors → machines, a real grid instead of per-machine
 coal. Energy storage. Brownouts when you overdraw.
