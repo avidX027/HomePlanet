@@ -16,8 +16,8 @@
 #include "raylib.h"   // needed for the Color type below
 
 // ─── Window ───────────────────────────────────────────────
-#define WINDOW_WIDTH   1280
-#define WINDOW_HEIGHT  720
+#define WINDOW_WIDTH   1920
+#define WINDOW_HEIGHT  1080
 #define WINDOW_TITLE   "HOME PLANET: VOID RUNNER"
 #define TARGET_FPS     60
 

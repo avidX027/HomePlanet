@@ -90,6 +90,45 @@ static float playerSinkTime = 0;
 static bool    playerJustDied = false;
 static Vector2 playerDeathPos = { 0, 0 };
 
+// ─── Dev modes ────────────────────────────────────────────
+// Same rule as everything in debug.h: these are LIVE MEMORY only.
+// They sit outside the Player struct (whose byte layout is the save
+// format), and nothing writes them to disk — so a world saved in
+// creative loads back as an ordinary world, and a build shipped to
+// someone else can't be silently left in god mode.
+//
+//   devGodMode     PlayerDamage returns early — nothing can hurt you
+//   devCreative    unlocks the item picker (C) and far zoom-out
+//   devMapEdit     painting tiles instead of playing; see below
+//   devBrushTile   which tile the brush lays down
+//   devBrushDir    facing for painted belts/inserters/drills
+//   devBrushRadius 0 = 1x1, 1 = 3x3, 2 = 5x5, ...
+//
+// HOW MAP EDIT TURNS ON — two doors into the same state, because
+// reaching for F3 mid-build is the thing that breaks flow:
+//   1. Zoom out past DEV_MAPEDIT_ZOOM while in creative, or
+//   2. the MAP PAINTER page of the F3 console.
+// Zooming back IN past the threshold leaves the mode, so the wheel
+// alone is a complete round trip: play, paint, play.
+#define DEV_MAPEDIT_ZOOM   0.45f   // at or below this = painting
+#define DEV_CREATIVE_ZOOM  0.12f   // how far creative may pull back
+#define DEV_BRUSH_MAX      12      // radius cap (25x25 tiles)
+static bool     devGodMode  = false;
+static bool     devCreative = false;
+static bool     devMapEdit  = false;
+static bool     devCreativePickerOpen = false;
+static TileType devBrushTile   = TILE_WALL;
+static int      devBrushDir    = 0;
+static int      devBrushRadius = 0;
+
+// The F3 console can't reach `camera` (it lives in main.c, which
+// includes debug.h last). So the console asks for a zoom by leaving
+// a number here and main.c applies it — which keeps camera.zoom the
+// ONE thing that decides whether the painter is on. If the button
+// set devMapEdit directly, the zoom check would just overwrite it
+// on the very next frame.
+static float    devZoomRequest = 0;   // > 0 = please set camera.zoom to this
+
 // ─── Pickup toasts ────────────────────────────────────────
 // "+12 Stone" floating up over the player, Factorio-style. Repeats
 // of the same item MERGE into the live toast rather than stacking
@@ -239,6 +278,8 @@ static void PlayerToggleTechMenu(Player *p) {
 
 // ─── Health ───────────────────────────────────────────────
 static void PlayerDamage(Player *p, float dmg) {
+    if (devGodMode) return;   // one gate, so EVERY source is covered:
+                              // mobs, explosions, quicksand, your own bomb
     if (p->invulnTimer > 0 || dmg <= 0) return;
     p->hp -= dmg;
     p->hurtTimer  = 0.4f;
@@ -250,6 +291,7 @@ static void PlayerDamage(Player *p, float dmg) {
         // where you fell, in a heap on the ground. Dying in the waste
         // now means a very deliberate walk back to your own corpse,
         // through whatever killed you.
+        SfxPlay(SFX_PLAYER_DIE, 0.9f, 0.0f);   // no wobble — death is death
         playerJustDied = true;
         playerDeathPos = p->pos;
         p->pos = (Vector2){ WorldCenterPx(), WorldCenterPx() };
@@ -459,6 +501,7 @@ static void PlayerUpdateReload(Player *p, float dt) {
     if (load <= 0) return;
     PlayerRemoveItem(p, ammo, load);
     p->mag[gun] += load;
+    SfxPlay(SFX_RELOAD, 0.5f, 1.0f);   // the clack that means "go again"
 }
 
 // ─── Q: quick-draw / cycle weapons ────────────────────────
@@ -649,6 +692,7 @@ static bool PlayerResearch(Player *p, TechID t) {
     PlayerRemoveItem(p, TECHS[t].costA, TECHS[t].nA);
     if (TECHS[t].costB != ITEM_NONE) PlayerRemoveItem(p, TECHS[t].costB, TECHS[t].nB);
     p->techUnlocked[t] = true;
+    SfxPlay(SFX_RESEARCH, 0.7f, 0.0f);   // the one sound that rises
     return true;
 }
 
@@ -826,6 +870,7 @@ static void PlayerUpdateCrafting(Player *p, float dt) {
     if (p->craftProgress < need) return;
 
     PlayerGiveItem(p, head, ITEMS[head].yield);
+    SfxPlay(SFX_CRAFT_DONE, 0.45f, 1.0f);
     PlayerCraftQueuePop(p);
 }
 

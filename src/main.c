@@ -867,10 +867,12 @@ static void UpdateMiningAndPlacing(float dt) {
                     PlayerRemoveItem(&player, ITEM_SMALL_STONE, 1);   // ammo consumed...
                     SpawnProjectile(player.pos, mouse, ITEM_SMALL_STONE, false);  // ...and flies
                     AddEffect(EFFECT_FLASH, muzzle, 5, 0.05f);
+                    SfxPlay(SFX_SHOT_SMALL, 0.30f, 2.0f);   // a snap, not a bang
                 } else if (held == ITEM_PISTOL) {
                     SpawnProjectile(player.pos, mouse, ITEM_BULLET, false);
                     AddEffect(EFFECT_FLASH, muzzle, 7, 0.06f);
                     entShake += 0.8f;
+                    SfxPlay(SFX_SHOT_SMALL, 0.55f, 1.0f);
                 } else if (held == ITEM_SMG) {
                     // A pinch of recoil spread so it feels like an SMG.
                     Vector2 spread = Vector2Rotate(Vector2Subtract(mouse, player.pos),
@@ -878,6 +880,9 @@ static void UpdateMiningAndPlacing(float dt) {
                     SpawnProjectile(player.pos, Vector2Add(player.pos, spread), ITEM_BULLET, false);
                     AddEffect(EFFECT_FLASH, muzzle, 6, 0.05f);
                     entShake += 0.35f;
+                    // Heavier pitch wobble: an SMG that repeats one
+                    // identical click sounds like a stuck keyboard.
+                    SfxPlay(SFX_SHOT_SMALL, 0.40f, 3.0f);
                 } else if (held == ITEM_SHOTGUN) {
                     for (int pellet = 0; pellet < SHOTGUN_PELLETS; pellet++) {
                         Vector2 spread = Vector2Rotate(Vector2Subtract(mouse, player.pos),
@@ -886,6 +891,7 @@ static void UpdateMiningAndPlacing(float dt) {
                     }
                     AddEffect(EFFECT_FLASH, muzzle, 10, 0.08f);
                     entShake += 2.6f;
+                    SfxPlay(SFX_SHOT_BIG, 0.85f, 1.0f);
                 }
                 weaponCooldown = interval;
                 // Ran the mag dry with that shot → start reloading now.
@@ -972,11 +978,12 @@ static void UpdateMiningAndPlacing(float dt) {
             // facing. Claim the record FIRST: if the pool is full the
             // build is refused outright, because a machine tile with
             // no record is a dead stub that merely looks placeable.
-            if (TileIsMachine(it->places)) {
-                if (AddMachineAt(tx, ty, it->places, player.placeDir) == NULL) return;
+            if (TileNeedsRecord(it->places)) {
+                if (AddMachineRecordAt(tx, ty, it->places, player.placeDir) == NULL) return;
             }
             WorldSetTile(tx, ty, it->places);         // grass → the item's tile
             PlayerRemoveSelectedItem(&player, 1);     // consume one from inventory
+            SfxPlay(SFX_PLACE, 0.45f, 1.5f);          // the thud of it landing
         }
     }
 }
@@ -1155,6 +1162,104 @@ static void UpdateFilterPicker(void) {
     }
 }
 
+// ─── The creative picker's clicks ────────────────────────────
+// Modal, same as the filter picker above, and hit-tested through the
+// same layout functions ui.h drew with. A click hands you a full
+// stack; shift takes a single item, for when you want exactly one
+// research computer and not a hundred.
+static void UpdateCreativePicker(void) {
+    if (!devCreative) { devCreativePickerOpen = false; return; }
+
+    FilterPickerLayout l = { 0 };
+    UiGetFilterPickerLayout(&l);
+    Vector2 mp = GetMousePosition();
+    Rectangle panel = { (float)l.x, (float)l.y, (float)l.w, (float)l.h };
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        devCreativePickerOpen = false;
+        return;
+    }
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+
+    if (CheckCollisionPointRec(mp, UiPanelCloseRect(l.x, l.y, l.w)) ||
+        !CheckCollisionPointRec(mp, panel)) {
+        devCreativePickerOpen = false;
+        return;
+    }
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    for (int i = 0; i < l.count; i++) {
+        Rectangle r = UiFilterCellRect(&l, i);
+        if (r.y + r.height > l.clearRect.y - 6) break;   // same cut-off ui.h draws
+        if (CheckCollisionPointRec(mp, r)) {
+            PlayerGiveItem(&player, UiFilterItemAt(i), shift ? 1 : STACK_MAX);
+            // Stays OPEN: kitting yourself out is usually several
+            // items in a row, and re-opening between each is friction
+            // for no reason.
+            return;
+        }
+    }
+}
+
+// ─── The map painter's input ─────────────────────────────────
+// Replaces mining/building/shooting entirely while it's on: the
+// mouse belongs to the brush. Runs in WORLD space through the same
+// camera the game draws with, so the tile under the cursor is the
+// tile that gets painted however far out you've zoomed.
+static void UpdateMapPainter(void) {
+    Vector2 mp = GetMousePosition();
+
+    // The palette strip owns its own clicks — no painting under it.
+    if (CheckCollisionPointRec(mp, UiMapEditBarRect())) {
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            int hit = UiMapEditSwatchAt(mp);
+            if (hit >= 0) {
+                devBrushTile = (TileType)hit;
+                SfxPlay(SFX_UI_CLICK, 0.35f, 1.0f);
+            }
+        }
+        return;
+    }
+
+    // Brush size and facing.
+    if (IsKeyPressed(KEY_LEFT_BRACKET)  && devBrushRadius > 0) devBrushRadius--;
+    if (IsKeyPressed(KEY_RIGHT_BRACKET) && devBrushRadius < DEV_BRUSH_MAX) devBrushRadius++;
+    if (IsKeyPressed(KEY_R)) devBrushDir = (devBrushDir + 1) & 3;
+
+    Vector2 mw = GetScreenToWorld2D(mp, camera);
+    int tx = (int)(mw.x / TILE_SIZE), ty = (int)(mw.y / TILE_SIZE);
+    if (!WorldInBounds(tx, ty)) return;
+
+    // HELD, not pressed — dragging a brush across the map is the
+    // whole point of a painter.
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        DevPaintBrush(tx, ty, devBrushRadius, devBrushTile);
+        SfxPlay(SFX_PLACE, 0.25f, 2.0f);
+    } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+        DevPaintBrush(tx, ty, devBrushRadius, TILE_GRASS);
+        SfxPlay(SFX_PLACE, 0.18f, 2.0f);
+    }
+}
+
+// The brush footprint, drawn in world space over the tiles it would
+// cover. Called from inside BeginMode2D.
+static void DrawMapPainterGhost(void) {
+    if (!devMapEdit) return;
+    Vector2 mp = GetMousePosition();
+    if (CheckCollisionPointRec(mp, UiMapEditBarRect())) return;
+
+    Vector2 mw = GetScreenToWorld2D(mp, camera);
+    int tx = (int)(mw.x / TILE_SIZE), ty = (int)(mw.y / TILE_SIZE);
+    int r = devBrushRadius;
+    Rectangle box = { (float)((tx - r) * TILE_SIZE), (float)((ty - r) * TILE_SIZE),
+                      (float)((r * 2 + 1) * TILE_SIZE), (float)((r * 2 + 1) * TILE_SIZE) };
+    Color c = TILES[devBrushTile].color;
+    DrawRectangleRec(box, (Color){ c.r, c.g, c.b, 90 });
+    // Line thickness scales with zoom so the outline stays visible
+    // when you're pulled way back looking at half the map.
+    float thick = 2.0f / (camera.zoom > 0.01f ? camera.zoom : 0.01f);
+    DrawRectangleLinesEx(box, thick, (Color){ 255, 200, 60, 230 });
+}
+
 // ─── One frame of gameplay ───────────────────────────────────
 // DESIGN CHANGE — menus no longer pause the world. Mobs keep
 // marching while you dig through your backpack (rust-like: the
@@ -1173,6 +1278,34 @@ static void UpdateGame(float dt) {
     if (IsKeyPressed(KEY_E))   { debugMenuOpen = false; PlayerToggleInventory(&player); }
     if (IsKeyPressed(KEY_TAB)) { debugMenuOpen = false; PlayerToggleCraftMenu(&player); }
 
+    // C — the creative stack picker. Only exists in creative mode, so
+    // the key is free in a normal game.
+    if (IsKeyPressed(KEY_C) && devCreative) {
+        devCreativePickerOpen = !devCreativePickerOpen;
+        if (devCreativePickerOpen) { debugMenuOpen = false; PlayerCloseMenus(&player); }
+    }
+    if (!devCreative) devCreativePickerOpen = false;
+
+    // ── The zoom door into map edit ──────────────────────────
+    // THE POINT of this: in creative, pulling the camera back far
+    // enough IS the gesture for "I'm working on the map now", and
+    // pushing it back in is "I'm playing again". No menu, no mode
+    // key — the same wheel you already use to look around. The F3
+    // MAP PAINTER page is the other door to the identical state.
+    if (devZoomRequest > 0) {          // the F3 console asked for a zoom
+        camera.zoom = devZoomRequest;
+        devZoomRequest = 0;
+    }
+    if (devCreative) {
+        bool farOut = (camera.zoom <= DEV_MAPEDIT_ZOOM);
+        if (farOut != devMapEdit) {
+            devMapEdit = farOut;
+            if (devMapEdit) { PlayerCloseMenus(&player); devCreativePickerOpen = false; }
+        }
+    } else if (devMapEdit) {
+        devMapEdit = false;   // creative off takes the painter with it
+    }
+
     // Q — the "back to the fight" key: slams every menu shut and
     // draws your best weapon, or cycles to the next one if a gun is
     // already in hand.
@@ -1188,6 +1321,8 @@ static void UpdateGame(float dt) {
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (debugMenuOpen) {
             debugMenuOpen = false;
+        } else if (devCreativePickerOpen) {
+            devCreativePickerOpen = false;
         } else if (machineFilterPickerOpen) {
             machineFilterPickerOpen = false;
         } else if (tunnelDragging) {
@@ -1214,7 +1349,9 @@ static void UpdateGame(float dt) {
     // is hit-tested through the same rect function the drawing uses,
     // so click targets can never drift from pixels.
     // (Skipped entirely while the filter picker is up — it's modal.)
-    if (machineFilterPickerOpen) {
+    if (devCreativePickerOpen) {
+        UpdateCreativePicker();
+    } else if (machineFilterPickerOpen) {
         UpdateFilterPicker();
     } else {
         Vector2 mouse = GetMousePosition();   // menus live in SCREEN space
@@ -1633,9 +1770,13 @@ static void UpdateGame(float dt) {
     // the arrow keys, leaving WASD free so you can keep walking
     // while you craft or shuffle your backpack.
     bool anyMenu = player.inventoryOpen || player.craftMenuOpen ||
-                   player.techMenuOpen || debugMenuOpen || machineUiX >= 0;
+                   player.techMenuOpen || debugMenuOpen || machineUiX >= 0 ||
+                   devCreativePickerOpen;
 
     if (!anyMenu) {
+      // The painter takes the whole mouse: no mining, no building, no
+      // shooting, and R/X mean brush things instead of player things.
+      if (!devMapEdit) {
         // R means three things, resolved by what's under your hand:
         // holding a gun → RELOAD; hovering a placed belt/arm →
         // rotate it in place; otherwise → spin the build ghost.
@@ -1677,15 +1818,27 @@ static void UpdateGame(float dt) {
             int clickedSlot = UiHotbarSlotAt(&player, GetMousePosition());
             if (clickedSlot >= 0) PlayerSelectSlot(&player, clickedSlot);
         }
+      }
 
         // Mouse wheel: Ctrl+wheel zooms the camera, plain wheel
         // cycles the hotbar. Kept as a float: trackpads report
         // fractional scrolls that an int would truncate to 0.
         float wheel = GetMouseWheelMove();
         if (wheel != 0.0f) {
-            if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
-                camera.zoom += wheel * 0.1f;
-                if (camera.zoom < 0.6f) camera.zoom = 0.6f;   // clamp: not too far out
+            bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+            // While painting, the bare wheel zooms: the hotbar means
+            // nothing in that mode, and the wheel is the way back out
+            // — needing a modifier to leave would be a trap.
+            if (ctrl || devMapEdit) {
+                // The step shrinks as you pull back, so the far range
+                // creative opens up stays controllable. At normal
+                // zoom (>= 0.6) it's the same flat 0.1 it always was.
+                float step = 0.1f * ((camera.zoom < 0.6f) ? (camera.zoom / 0.6f) : 1.0f);
+                camera.zoom += wheel * step;
+                // Creative may pull back far enough to see the map as
+                // a map; a normal game stays at the old limit.
+                float minZoom = devCreative ? DEV_CREATIVE_ZOOM : 0.6f;
+                if (camera.zoom < minZoom) camera.zoom = minZoom;
                 if (camera.zoom > 2.0f) camera.zoom = 2.0f;   // ...or in
             } else {
                 if (wheel > 0) PlayerSelectRelative(&player, -1);
@@ -1700,7 +1853,8 @@ static void UpdateGame(float dt) {
 
         // Holding G shows the world map — mouse clicks belong to
         // the map then, not to mining/shooting under the overlay.
-        if (!IsKeyDown(KEY_G)) UpdateMiningAndPlacing(dt);
+        if (devMapEdit)             UpdateMapPainter();
+        else if (!IsKeyDown(KEY_G)) UpdateMiningAndPlacing(dt);
     }
 
     // A tunnel drag can be abandoned in ways the tool never sees: you
@@ -1774,6 +1928,7 @@ static void DrawGame(void) {
         // doesn't know the camera exists.
         PlayerDrawHeldItem(&player, GetScreenToWorld2D(GetMousePosition(), camera));
         DrawPlacementGhost();   // preview of what RMB will build
+        DrawMapPainterGhost();  // ...or the brush footprint, if painting
         PlayerDrawToasts(player.pos);   // "+12 Stone" floating up
     EndMode2D();
 
@@ -1797,6 +1952,8 @@ static void DrawGame(void) {
     UiDrawMachinePanel(&player);   // chest / drill / inserter / belt
     UiDrawTechMenu(&player);
     UiDrawFilterPicker();       // the item grid, over the panel it edits
+    UiDrawCreativePicker(&player);  // the same grid, handing out stacks
+    UiDrawMapEditBar();         // the tile palette, while painting
     UiDrawDragGhost();          // the stack riding the cursor
     DebugMenuDraw(&player);     // F3 console — always on top of the rest
 }
@@ -2009,6 +2166,7 @@ int main(void) {
     SetExitKey(KEY_NULL); // handle Escape ourselves in game logic
                           // (raylib's default is "Escape quits the app")
     WorldMinimapInit();   // needs the window to exist (GPU texture)
+    SfxInit();            // same reason: the audio device wants a window
     NewGame();            // world + player + entities, in order
     camera.zoom = 1.2f;   // start slightly zoomed in
 
@@ -2017,6 +2175,14 @@ int main(void) {
     // Escape raises quitRequested.
     while (!WindowShouldClose() && !quitRequested) {
         float dt = GetFrameTime();   // seconds since last frame ("delta time")
+
+        // 0) AUDIO housekeeping, before anything can make a noise:
+        //    tick the anti-spam cooldowns down, and move the "ears" to
+        //    wherever the player is standing — SfxPlayAt measures
+        //    distance from here, so without this every positional
+        //    sound is judged against the world's top-left corner.
+        SfxUpdate(dt);
+        WorldSetListener(player.pos);
 
         // 1) UPDATE — route input to whichever screen is active.
         if      (screen == SCREEN_TITLE)      UpdateTitle();
@@ -2037,6 +2203,7 @@ int main(void) {
         EndDrawing();  // presents the finished frame and waits for vsync
     }
 
+    SfxShutdown();  // free the sample buffers, close the audio device
     CloseWindow();  // clean shutdown: give the window back to the OS
     return 0;       // exit code 0 = "everything went fine"
 }

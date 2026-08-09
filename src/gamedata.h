@@ -784,9 +784,9 @@ static bool ItemIsWeapon(ItemID id) { return ItemWeaponRank(id) > 0; }
 // feeds straight from the stone pile).
 static int ItemMagSize(ItemID id) {
     switch (id) {
-        case ITEM_PISTOL:  return 12;
+        case ITEM_PISTOL:  return 15;
         case ITEM_SMG:     return 30;
-        case ITEM_SHOTGUN: return 6;
+        case ITEM_SHOTGUN: return 8;
         default:           return 0;
     }
 }
@@ -940,6 +940,17 @@ static bool TileIsMachine(TileType t) {
     return t == TILE_CHEST || t == TILE_DRILL || TileIsBeltLike(t) ||
            t == TILE_INSERTER || t == TILE_TURRET || t == TILE_LASER_TURRET ||
            t == TILE_RESEARCH;
+}
+
+// Tiles that need a Machine RECORD — a WIDER set than TileIsMachine.
+// A mob nest holds no items and opens no panel, so it isn't a
+// "machine" in the UI sense, but its breeding timer has to live
+// somewhere and that somewhere is a record. UpdateSpawnersAndRaids
+// walks machines[] looking for TILE_SPAWNER, so a nest without a
+// record is completely inert — it just sits there looking like a
+// nest. Every path that puts a tile into the world asks THIS.
+static bool TileNeedsRecord(TileType t) {
+    return TileIsMachine(t) || t == TILE_SPAWNER;
 }
 
 // Machines whose facing matters — R rotates these in place.

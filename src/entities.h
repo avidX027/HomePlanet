@@ -261,6 +261,17 @@ static Machine *AddMachineAt(int x, int y, TileType type, int dir) {
     return &machines[slot];
 }
 
+// Add a record for a tile that just appeared in the world. Wraps
+// AddMachineAt with the one piece of per-type setup that placement
+// needs: a nest gets a staggered first tick, so a row of them
+// doesn't breed in lockstep (and a freshly placed one doesn't spit
+// a mob out on the very next frame).
+static Machine *AddMachineRecordAt(int x, int y, TileType t, int dir) {
+    Machine *m = AddMachineAt(x, y, t, dir);
+    if (m != NULL && t == TILE_SPAWNER) m->timer = (float)GetRandomValue(2, 12);
+    return m;
+}
+
 // How many slots does this machine actually expose? A chest is a
 // full 7x7; a drill needs a few (rock yields four different ores);
 // belts and inserters carry exactly one item.
@@ -496,6 +507,9 @@ static void GroundPickupNear(Player *p, Vector2 at, float radius, float minAge) 
         int before = p->inventory[g->id];
         PlayerGiveItem(p, g->id, g->count);
         int took = p->inventory[g->id] - before;
+        // Only when something actually LANDED — a full backpack
+        // standing over a pile shouldn't click at you forever.
+        if (took > 0) SfxPlay(SFX_PICKUP, 0.35f, 2.0f);
         if (took >= g->count) g->active = false;
         else if (took > 0)    g->count -= took;
     }
@@ -591,6 +605,63 @@ static void RemoveMachineAt(int x, int y, Player *giveTo) {
     FreeMachineRecord(m, giveTo);
 }
 
+// ─── The map painter's brush ──────────────────────────────
+// Painting is NOT mining: a tile that gets painted over doesn't
+// break, drop, or refund anything. It's an editor, so the old tile
+// simply stops existing — which is why this can't reuse
+// RemoveMachineAt (that one drops the contents on the floor, and a
+// wide brush over a chest farm would bury the map in loose items).
+static void DevClearMachineSilently(int x, int y) {
+    Machine *m = MachineAt(x, y);
+    if (m == NULL) return;
+    // A tunnel is a PAIR. Painting over one mouth has to take the
+    // far one with it, or the survivor keeps a link pointing at a
+    // tile that is no longer a tunnel.
+    if (TileIsTunnel(m->type)) {
+        int px = m->linkX, py = m->linkY;
+        if (px >= 0 && py >= 0 && WorldInBounds(px, py) &&
+            TileIsTunnel(world[px][py].type)) {
+            Machine *far = MachineAt(px, py);
+            if (far != NULL) { machineIndex[px][py] = -1; far->active = false; }
+            WorldSetTile(px, py, TILE_GRASS);
+        }
+    }
+    if (WorldInBounds(m->x, m->y)) machineIndex[m->x][m->y] = -1;
+    m->active = false;
+}
+
+// Lay one tile down, keeping the machine records honest in both
+// directions: whatever was here loses its record, and whatever
+// arrives gets one if its type needs it.
+static void DevPaintTile(int x, int y, TileType t) {
+    if (!WorldInBounds(x, y)) return;
+    if (t < 0 || t >= TILE_COUNT) return;
+    // Repainting a machine onto itself is a real operation (it
+    // re-facings the record), but repainting plain ground onto
+    // itself is a no-op worth skipping — a held brush hits the same
+    // tile every frame.
+    if (world[x][y].type == t && !TileNeedsRecord(t)) return;
+
+    DevClearMachineSilently(x, y);
+    WorldSetTile(x, y, t);
+    if (TileNeedsRecord(t) && AddMachineRecordAt(x, y, t, devBrushDir) == NULL) {
+        // Machine pool full — refuse rather than leave a machine tile
+        // with no record behind it, which draws as a dead stub.
+        WorldSetTile(x, y, TILE_GRASS);
+    }
+}
+
+// The brush proper: a square of radius r, clipped to the map.
+static void DevPaintBrush(int cx, int cy, int radius, TileType t) {
+    if (radius < 0) radius = 0;
+    if (radius > DEV_BRUSH_MAX) radius = DEV_BRUSH_MAX;
+    for (int x = cx - radius; x <= cx + radius; x++) {
+        for (int y = cy - radius; y <= cy + radius; y++) {
+            DevPaintTile(x, y, t);
+        }
+    }
+}
+
 // Give EVERY tile that needs per-instance state a machine record.
 // Called after worldgen and — importantly — after any failed or
 // partial entity load: the tile grid survives such a failure, so
@@ -602,13 +673,8 @@ static void EntitiesRegisterWorldMachines(void) {
     for (int x = 0; x < WORLD_SIZE; x++) {
         for (int y = 0; y < WORLD_SIZE; y++) {
             TileType t = world[x][y].type;
-            if (t == TILE_SPAWNER) {
-                if (MachineAt(x, y) == NULL) {
-                    Machine *m = AddMachineAt(x, y, TILE_SPAWNER, 0);
-                    if (m != NULL) m->timer = (float)GetRandomValue(2, 12);
-                }
-            } else if (TileIsMachine(t) && MachineAt(x, y) == NULL) {
-                AddMachineAt(x, y, t, 0);
+            if (TileNeedsRecord(t) && MachineAt(x, y) == NULL) {
+                AddMachineRecordAt(x, y, t, 0);   // stagger is handled in there
             }
         }
     }
@@ -719,6 +785,7 @@ static void MobDamage(Mob *m, float dmg) {
         }
     } else {
         AddEffect(EFFECT_SPARK, m->pos, 7, 0.12f);   // hit feedback
+        SfxPlayAt(SFX_MOB_HIT, m->pos, worldListener, 0.35f);
     }
 }
 
@@ -769,6 +836,7 @@ static void ExplodeAt(Vector2 pos, float radius, Player *p) {
     }
     AddEffect(EFFECT_RING, pos, radius, 0.45f);
     entShake += 7.0f;   // explosions should be FELT
+    SfxPlayAt(SFX_EXPLODE, pos, worldListener, 1.0f);   // ...and HEARD
 }
 
 // ─── Projectiles ──────────────────────────────────────────
@@ -880,6 +948,7 @@ static void PlaceBomb(Vector2 pos) {
     for (int i = 0; i < MAX_BOMBS; i++) {
         if (!bombs[i].active) {
             bombs[i] = (Bomb){ true, pos, BOMB_FUSE };
+            SfxPlayAt(SFX_BOMB_ARM, pos, worldListener, 0.7f);
             return;
         }
     }
@@ -1418,6 +1487,7 @@ static void UpdateMachines(float dt, Player *p) {
             }
             if (bestI >= 0) {
                 SpawnProjectile(center, mobs[bestI].pos, ITEM_BULLET, true);
+                SfxPlayAt(SFX_SHOT_SMALL, center, worldListener, 0.45f);
                 m->ammo--;
                 m->timer = TUNE.turretCooldown;
                 break;
@@ -1439,6 +1509,7 @@ static void UpdateMachines(float dt, Player *p) {
             if (sx >= 0) {
                 Vector2 target = { (sx + 0.5f) * TILE_SIZE, (sy + 0.5f) * TILE_SIZE };
                 SpawnProjectile(center, target, ITEM_BULLET, true);
+                SfxPlayAt(SFX_SHOT_SMALL, center, worldListener, 0.45f);
                 m->ammo--;
                 m->timer = TUNE.turretCooldown;
             }
@@ -1461,6 +1532,7 @@ static void UpdateMachines(float dt, Player *p) {
                 m->beamTo  = mobs[bestI].pos;
                 m->beamTtl = 0.12f;
                 AddBeam(center, mobs[bestI].pos);
+                SfxPlayAt(SFX_LASER, center, worldListener, 0.5f);
                 MobDamage(&mobs[bestI], TUNE.laserDamage);
                 m->timer = TUNE.laserCooldown;
             }
@@ -1629,6 +1701,7 @@ static void BeltPickupNear(Player *p, float radiusPx) {
             Machine *m = MachineAt(x, y);
             if (m == NULL || m->slots[0] == ITEM_NONE || m->counts[0] <= 0) continue;
             PlayerGiveItem(p, m->slots[0], m->counts[0]);
+            SfxPlay(SFX_PICKUP, 0.35f, 2.0f);
             m->slots[0] = ITEM_NONE;
             m->counts[0] = 0;
             m->beltProgress = 0;

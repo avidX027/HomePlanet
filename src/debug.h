@@ -41,7 +41,7 @@ static const void *debugActiveSlider = NULL;
 
 // The registry list = three GLOBAL pages, then every tile, then
 // every item (skipping ITEM_NONE).
-#define DEBUG_GLOBAL_PAGES       3
+#define DEBUG_GLOBAL_PAGES       5
 #define DEBUG_ENTRY_TILES_START  DEBUG_GLOBAL_PAGES
 #define DEBUG_ENTRY_ITEMS_START  (DEBUG_GLOBAL_PAGES + TILE_COUNT)
 #define DEBUG_ENTRY_COUNT        (DEBUG_GLOBAL_PAGES + TILE_COUNT + (ITEM_COUNT - 1))
@@ -271,6 +271,123 @@ static void DebugDrawGlobalMobsPanel(Rectangle panel) {
     }
 }
 
+// ─── Page: creative & cheats ──────────────────────────────
+static void DebugDrawCreativePanel(Rectangle panel, Player *p) {
+    float x = panel.x + 16, w = panel.width - 32, y = panel.y + 14;
+    Rectangle row;
+
+    DrawText("CREATIVE & CHEATS", (int)x, (int)y, 26, DBG_GREEN);
+    DrawText("live modes — none of this is written to the save file",
+             (int)x, (int)y + 30, 13, DBG_FAINT);
+    y += 56;
+
+    y = DebugSection(x, y, w, "MODES");
+    row = (Rectangle){ x, y, w, DBG_ROW_H };
+    DebugToggle(row, "God mode (nothing can hurt you)", &devGodMode); y += DBG_ROW_H;
+    row.y = y; DebugToggle(row, "Creative (C = take stacks, far zoom)", &devCreative); y += DBG_ROW_H;
+
+    DrawText(devCreative
+             ? "Creative is ON — press C in game for the item picker, or zoom out to paint."
+             : "Turn Creative ON to unlock the item picker and the zoom-out map painter.",
+             (int)x, (int)y + 4, 12, devCreative ? DBG_GREEN : DBG_FAINT);
+    y += 26;
+
+    y = DebugSection(x, y + 8, w, "PLAYER");
+    if (DebugButton((Rectangle){ x, y + 4, 150, 28 }, "FULL HEAL", DBG_ACCENT)) {
+        p->hp = PLAYER_MAX_HP;
+        p->regenDelay = 0;
+    }
+    if (DebugButton((Rectangle){ x + 166, y + 4, 170, 28 }, "UNLOCK ALL TECH", DBG_ACCENT)) {
+        for (int t = 1; t < TECH_COUNT; t++) p->techUnlocked[t] = true;
+    }
+    if (DebugButton((Rectangle){ x + 352, y + 4, 170, 28 }, "CLEAR INVENTORY", DBG_RED)) {
+        for (int i = 0; i < INVENTORY_SIZE; i++) {
+            p->inventorySlots[i] = ITEM_NONE;
+            p->inventoryAmounts[i] = 0;
+        }
+        PlayerRecount(p);
+    }
+    y += 40;
+
+    DrawText(TextFormat("hp %.0f/%d   god %s   creative %s   painting %s",
+                        p->hp, PLAYER_MAX_HP,
+                        devGodMode ? "ON" : "off",
+                        devCreative ? "ON" : "off",
+                        devMapEdit ? "ON" : "off"),
+             (int)x, (int)(panel.y + panel.height - 22), 11, DBG_FAINT);
+}
+
+// ─── Page: map painter ────────────────────────────────────
+// The console half of the painter. The other half — and the one
+// meant for actual use — is zooming out past DEV_MAPEDIT_ZOOM in
+// creative. Both land in exactly the same state, because both do
+// the same single thing: move the camera.
+static void DebugDrawMapPainterPanel(Rectangle panel) {
+    float x = panel.x + 16, w = panel.width - 32, y = panel.y + 14;
+    Rectangle row;
+
+    DrawText("MAP PAINTER", (int)x, (int)y, 26, DBG_GREEN);
+    DrawText("paint tiles straight onto the world — no cost, no drops, no mining",
+             (int)x, (int)y + 30, 13, DBG_FAINT);
+    y += 56;
+
+    y = DebugSection(x, y, w, "BRUSH");
+    row = (Rectangle){ x, y, w, DBG_ROW_H };
+    DebugSliderTile(row, "Tile", &devBrushTile); y += DBG_ROW_H;
+    row.y = y; DebugSliderInt(row, "Radius (0 = single tile)", &devBrushRadius, 0, DEV_BRUSH_MAX); y += DBG_ROW_H;
+    row.y = y; DebugSliderInt(row, "Facing (belts/arms/drills)", &devBrushDir, 0, 3); y += DBG_ROW_H;
+
+    DrawText(TextFormat("footprint %dx%d tiles   facing %s",
+                        devBrushRadius * 2 + 1, devBrushRadius * 2 + 1,
+                        (devBrushDir == 0) ? "East" : (devBrushDir == 1) ? "South" :
+                        (devBrushDir == 2) ? "West" : "North"),
+             (int)x, (int)y + 4, 12, DBG_FAINT);
+    y += 26;
+
+    // The palette, same swatch order as the in-game bar so the two
+    // read as one tool.
+    y = DebugSection(x, y + 8, w, "PALETTE");
+    {
+        float cell = 34, gap = 5;
+        int perRow = (int)((w + gap) / (cell + gap));
+        if (perRow < 1) perRow = 1;
+        Vector2 m = GetMousePosition();
+        for (int t = 0; t < TILE_COUNT; t++) {
+            Rectangle r = { x + (t % perRow) * (cell + gap),
+                            y + (t / perRow) * (cell + gap), cell, cell };
+            bool hovered = CheckCollisionPointRec(m, r);
+            bool sel = (t == (int)devBrushTile);
+            if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) devBrushTile = (TileType)t;
+            DrawRectangleRec(r, TILES[t].color);
+            DrawRectangleLinesEx(r, sel ? 3 : (hovered ? 2 : 1),
+                                 sel ? DBG_ACCENT : (hovered ? RAYWHITE : DBG_LINE));
+            if (hovered) {
+                DrawRectangle((int)r.x, (int)r.y - 17, MeasureText(TILES[t].name, 12) + 8, 15,
+                              (Color){ 8, 12, 10, 240 });
+                DrawText(TILES[t].name, (int)r.x + 4, (int)r.y - 16, 12, DBG_GREEN);
+            }
+        }
+        y += ((TILE_COUNT + perRow - 1) / perRow) * (cell + gap) + 8;
+    }
+
+    y = DebugSection(x, y + 4, w, "MODE");
+    if (!devMapEdit) {
+        if (DebugButton((Rectangle){ x, y + 4, 230, 30 }, "START PAINTING (zooms out)", DBG_ACCENT)) {
+            devCreative = true;          // painting implies creative
+            devZoomRequest = DEV_MAPEDIT_ZOOM - 0.05f;   // main.c moves the camera
+            debugMenuOpen = false;       // get out of the way
+        }
+    } else {
+        if (DebugButton((Rectangle){ x, y + 4, 230, 30 }, "STOP PAINTING (zooms in)", DBG_GREEN)) {
+            devZoomRequest = 1.0f;
+            debugMenuOpen = false;
+        }
+    }
+
+    DrawText("Or just Ctrl+wheel out past the threshold in creative — same mode, no menu.",
+             (int)x, (int)(panel.y + panel.height - 22), 11, DBG_FAINT);
+}
+
 static void DebugDrawGlobalMachinesPanel(Rectangle panel) {
     float x = panel.x + 16, w = panel.width - 32, y = panel.y + 14;
     Rectangle row;
@@ -332,7 +449,7 @@ static void DebugDrawTilePanel(Rectangle panel, TileType t) {
              (int)x, (int)(panel.y + panel.height - 22), 11, DBG_FAINT);
 }
 
-static void DebugDrawItemPanel(Rectangle panel, ItemID id) {
+static void DebugDrawItemPanel(Rectangle panel, ItemID id, Player *p) {
     ItemInfo *it = &ITEMS[id];
     float x = panel.x + 16, w = panel.width - 32, y = panel.y + 14;
     Rectangle row;
@@ -365,6 +482,23 @@ static void DebugDrawItemPanel(Rectangle panel, ItemID id) {
     row.y = y; DebugSliderByte(row, "Color G", &it->color.g); y += DBG_ROW_H;
     row.y = y; DebugSliderByte(row, "Color B", &it->color.b); y += DBG_ROW_H;
 
+    // Tuning a recipe you can't afford to test is half a tool, so the
+    // page that edits an item can also hand you some.
+    y = DebugSection(x, y + 8, w, TextFormat("GIVE  (you have %d)", p->inventory[id]));
+    if (DebugButton((Rectangle){ x, y + 4, 90, 28 }, "+1", DBG_ACCENT)) {
+        PlayerGiveItem(p, id, 1);
+    }
+    if (DebugButton((Rectangle){ x + 100, y + 4, 90, 28 }, "+10", DBG_ACCENT)) {
+        PlayerGiveItem(p, id, 10);
+    }
+    if (DebugButton((Rectangle){ x + 200, y + 4, 120, 28 },
+                    TextFormat("+%d STACK", STACK_MAX), DBG_ACCENT)) {
+        PlayerGiveItem(p, id, STACK_MAX);
+    }
+    if (DebugButton((Rectangle){ x + 330, y + 4, 110, 28 }, "TAKE ALL", DBG_RED)) {
+        PlayerRemoveItem(p, id, p->inventory[id]);
+    }
+
     DrawText(TextFormat("RAW: dps=%.2f inA=%d nA=%d inB=%d nB=%d yield=%d place=%d->%d rgb=(%d,%d,%d)",
                         it->miningDPS, (int)it->inA, it->nA, (int)it->inB, it->nB,
                         it->yield, it->placeable, (int)it->places,
@@ -376,7 +510,7 @@ static void DebugDrawItemPanel(Rectangle panel, ItemID id) {
 // Called from DrawGame every frame; does nothing while closed.
 // Immediate mode: this ONE call is both the input handling and the
 // rendering of the entire console.
-static void DebugMenuDraw(const Player *p) {
+static void DebugMenuDraw(Player *p) {
     if (!debugMenuOpen) return;
     DebugSaveDefaultsOnce();   // snapshot factory values on first open
 
@@ -446,8 +580,15 @@ static void DebugMenuDraw(const Player *p) {
         const char *label;
         bool modified = false;
         if (i < DEBUG_GLOBAL_PAGES) {
-            label = (i == 0) ? "PLAYER & WEAPONS" : (i == 1) ? "MOBS & RAIDS" : "MACHINES & BOTS";
-            modified = memcmp(&TUNE, &debugDefaultTune, sizeof(TUNE)) != 0;
+            label = (i == 0) ? "PLAYER & WEAPONS" :
+                    (i == 1) ? "MOBS & RAIDS"     :
+                    (i == 2) ? "MACHINES & BOTS"  :
+                    (i == 3) ? "CREATIVE & CHEATS" : "MAP PAINTER";
+            // The two dev pages aren't tuning tables — they mark
+            // themselves modified when their mode is actually live.
+            if (i == 3)      modified = devGodMode || devCreative;
+            else if (i == 4) modified = devMapEdit;
+            else             modified = memcmp(&TUNE, &debugDefaultTune, sizeof(TUNE)) != 0;
             DrawText(">", (int)r.x + 6, (int)r.y + 5, 14, DBG_ACCENT);
         } else if (i < DEBUG_ENTRY_ITEMS_START) {
             TileType t = (TileType)(i - DEBUG_ENTRY_TILES_START);
@@ -473,10 +614,12 @@ static void DebugMenuDraw(const Player *p) {
     if (debugListSel == 0)      DebugDrawGlobalWeaponsPanel(panel);
     else if (debugListSel == 1) DebugDrawGlobalMobsPanel(panel);
     else if (debugListSel == 2) DebugDrawGlobalMachinesPanel(panel);
+    else if (debugListSel == 3) DebugDrawCreativePanel(panel, p);
+    else if (debugListSel == 4) DebugDrawMapPainterPanel(panel);
     else if (debugListSel < DEBUG_ENTRY_ITEMS_START) {
         DebugDrawTilePanel(panel, (TileType)(debugListSel - DEBUG_ENTRY_TILES_START));
     } else {
-        DebugDrawItemPanel(panel, (ItemID)(debugListSel - DEBUG_ENTRY_ITEMS_START + 1));
+        DebugDrawItemPanel(panel, (ItemID)(debugListSel - DEBUG_ENTRY_ITEMS_START + 1), p);
     }
 
     // Footer: controls + the "this is live memory" warning.

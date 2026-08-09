@@ -361,6 +361,9 @@ static bool UiButtonUpdate(UIButton *button) {
     Vector2 mouse = GetMousePosition();
     button->hovered = CheckCollisionPointRec(mouse, button->rect);
     button->clicked = button->hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    // Every button in the game runs through here, so one line gives
+    // the whole UI a click.
+    if (button->clicked) SfxPlay(SFX_UI_CLICK, 0.35f, 1.0f);
     return button->clicked;
 }
 
@@ -1054,6 +1057,134 @@ static void UiDrawFilterPicker(void) {
     const char *label = "NO FILTER  (handle any item)";
     DrawText(label, (int)(l.clearRect.x + l.clearRect.width / 2) - MeasureText(label, 15) / 2,
              (int)l.clearRect.y + 10, 15, none ? UI_ACCENT : RAYWHITE);
+}
+
+// ─── Creative item picker (C, creative mode only) ─────────
+// Deliberately the SAME grid as the inserter's filter picker — same
+// layout function, same cell size, same hover tooltip — because
+// "pick an item from every item in the game" is the same question
+// twice, and a second look for it would just be a second thing to
+// learn. The only difference is what a click means: there it sets a
+// filter, here it drops a full stack in your pack.
+static void UiDrawCreativePicker(const Player *p) {
+    if (!devCreativePickerOpen) return;
+
+    FilterPickerLayout l = { 0 };
+    UiGetFilterPickerLayout(&l);
+
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), (Color){ 4, 4, 8, 150 });
+    UiDrawPanelFrame(l.x, l.y, l.w, l.h, "CREATIVE — TAKE A STACK");
+    UiDrawCloseButton(l.x, l.y, l.w);
+
+    Vector2 mouse = GetMousePosition();
+    for (int i = 0; i < l.count; i++) {
+        ItemID id = UiFilterItemAt(i);
+        if (id == ITEM_NONE) continue;
+        Rectangle r = UiFilterCellRect(&l, i);
+        if (r.y + r.height > l.clearRect.y - 6) break;
+        bool hovered = CheckCollisionPointRec(mouse, r);
+        bool owned   = (p->inventory[id] > 0);
+        DrawRectangleRec(r, hovered ? UI_SLOT_HOVER : UI_SLOT_BG);
+        DrawRectangleLinesEx(r, hovered ? 2 : 1, hovered ? UI_ACCENT : UI_SLOT_BORDER);
+        DrawItemSprite(id, r.x + 7, r.y + 5, 32);
+        // A faint count in the corner of things you already carry —
+        // the picker doubles as "what have I got?".
+        if (owned) {
+            DrawText(TextFormat("%d", p->inventory[id]),
+                     (int)r.x + 4, (int)(r.y + r.height) - 12, 10, (Color){ 200, 200, 205, 190 });
+        }
+        if (hovered) {
+            const char *nm = ITEMS[id].name;
+            int nw = MeasureText(nm, 12);
+            int bx = (int)(r.x + r.width / 2) - nw / 2 - 4;
+            if (bx < l.x + 4) bx = l.x + 4;
+            if (bx + nw + 8 > l.x + l.w - 4) bx = l.x + l.w - 12 - nw;
+            DrawRectangle(bx, (int)r.y - 18, nw + 8, 16, (Color){ 16, 16, 22, 235 });
+            DrawText(nm, bx + 4, (int)r.y - 16, 12, RAYWHITE);
+        }
+    }
+
+    const char *hint = TextFormat("[CLICK] take %d   [SHIFT+CLICK] take 1   [RMB/ESC/C] close",
+                                  STACK_MAX);
+    DrawText(hint, (int)(l.clearRect.x + l.clearRect.width / 2) - MeasureText(hint, 14) / 2,
+             (int)l.clearRect.y + 12, 14, (Color){ 190, 190, 196, 255 });
+}
+
+// ─── Map painter palette ──────────────────────────────────
+// A strip along the bottom holding every tile in the game. Same
+// shared-rectangle rule as the rest of this file: the layout math
+// lives here once, and main.c hit-tests the exact rectangles it
+// draws, so a click can never land somewhere other than where it
+// looks.
+#define UI_MAPEDIT_BAR_H 84
+
+static Rectangle UiMapEditBarRect(void) {
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+    return (Rectangle){ 0, (float)(sh - UI_MAPEDIT_BAR_H), (float)sw, (float)UI_MAPEDIT_BAR_H };
+}
+
+// Swatch `i` is tile `i`. Cells shrink to fit rather than wrapping —
+// one unbroken row stays readable as "the palette", and every tile
+// keeps the same place in it whatever the window size.
+static Rectangle UiMapEditSwatchRect(int i) {
+    Rectangle bar = UiMapEditBarRect();
+    int n = TILE_COUNT;
+    float gap = 4;
+    float avail = bar.width - 28;
+    float cell = (avail - gap * (n - 1)) / n;
+    if (cell > 42) cell = 42;
+    if (cell < 10) cell = 10;
+    float rowW = cell * n + gap * (n - 1);
+    float x0 = bar.x + (bar.width - rowW) / 2;
+    return (Rectangle){ x0 + i * (cell + gap), bar.y + 30, cell, cell };
+}
+
+// Which swatch is under the cursor? -1 for none.
+static int UiMapEditSwatchAt(Vector2 mouse) {
+    for (int i = 0; i < TILE_COUNT; i++) {
+        if (CheckCollisionPointRec(mouse, UiMapEditSwatchRect(i))) return i;
+    }
+    return -1;
+}
+
+static void UiDrawMapEditBar(void) {
+    if (!devMapEdit) return;
+    Rectangle bar = UiMapEditBarRect();
+    DrawRectangleRec(bar, (Color){ 10, 14, 12, 238 });
+    DrawLine((int)bar.x, (int)bar.y, (int)(bar.x + bar.width), (int)bar.y,
+             (Color){ 90, 255, 140, 255 });
+
+    DrawText(TextFormat("MAP PAINTER   brush: %s   size: %dx%d   facing: %s",
+                        TILES[devBrushTile].name,
+                        devBrushRadius * 2 + 1, devBrushRadius * 2 + 1,
+                        (devBrushDir == 0) ? "E" : (devBrushDir == 1) ? "S" :
+                        (devBrushDir == 2) ? "W" : "N"),
+             (int)bar.x + 14, (int)bar.y + 8, 14, (Color){ 90, 255, 140, 255 });
+
+    const char *keys = "[LMB] paint  [RMB] erase  [ / ] brush size  [R] facing  "
+                       "[WHEEL] zoom (in past the line = back to playing)";
+    DrawText(keys, (int)(bar.x + bar.width) - MeasureText(keys, 12) - 14,
+             (int)bar.y + 10, 12, (Color){ 70, 150, 100, 255 });
+
+    Vector2 mouse = GetMousePosition();
+    for (int i = 0; i < TILE_COUNT; i++) {
+        Rectangle r = UiMapEditSwatchRect(i);
+        bool hovered  = CheckCollisionPointRec(mouse, r);
+        bool selected = (i == (int)devBrushTile);
+        DrawRectangleRec(r, TILES[i].color);
+        DrawRectangleLinesEx(r, selected ? 3 : (hovered ? 2 : 1),
+                             selected ? (Color){ 255, 200, 60, 255 }
+                                      : (hovered ? RAYWHITE : (Color){ 45, 90, 62, 255 }));
+        if (hovered) {
+            const char *nm = TILES[i].name;
+            int nw = MeasureText(nm, 12);
+            int bx = (int)(r.x + r.width / 2) - nw / 2 - 4;
+            if (bx < 4) bx = 4;
+            if (bx + nw + 8 > GetScreenWidth() - 4) bx = GetScreenWidth() - 12 - nw;
+            DrawRectangle(bx, (int)r.y - 18, nw + 8, 16, (Color){ 16, 16, 22, 235 });
+            DrawText(nm, bx + 4, (int)r.y - 16, 12, RAYWHITE);
+        }
+    }
 }
 
 // ─── The saves screen ─────────────────────────────────────

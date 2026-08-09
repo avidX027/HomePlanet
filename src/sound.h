@@ -34,6 +34,16 @@ typedef enum {
     SFX_CRAFT_DONE,       // a build finished
     SFX_MACHINE_FAIL,     // a machine wore out and died
     SFX_PLACE,            // a block went down
+    SFX_SHOT_SMALL,       // slingshot, pistol, SMG, turret
+    SFX_SHOT_BIG,         // the shotgun, both barrels
+    SFX_LASER,            // the laser turret's beam
+    SFX_EXPLODE,          // a bomb went off
+    SFX_MOB_HIT,          // you hit one, it didn't die
+    SFX_PLAYER_DIE,       // you didn't make it
+    SFX_RELOAD,           // fresh mag seated
+    SFX_RESEARCH,         // a tech unlocked
+    SFX_BOMB_ARM,         // fuse lit — now run
+    SFX_UI_CLICK,         // a button in a menu
     SFX_COUNT
 } SfxID;
 
@@ -52,6 +62,19 @@ static const float SFX_MIN_GAP[SFX_COUNT] = {
     [SFX_CRAFT_DONE]   = 0.05f,
     [SFX_MACHINE_FAIL] = 0.10f,
     [SFX_PLACE]        = 0.05f,
+    // Auto-fire is the reason these are so short: the gap has to be
+    // under the weapon's own fire interval or the sound drops rounds
+    // the gun actually fired.
+    [SFX_SHOT_SMALL]   = 0.03f,
+    [SFX_SHOT_BIG]     = 0.08f,
+    [SFX_LASER]        = 0.05f,
+    [SFX_EXPLODE]      = 0.08f,
+    [SFX_MOB_HIT]      = 0.04f,
+    [SFX_PLAYER_DIE]   = 0.50f,
+    [SFX_RELOAD]       = 0.15f,
+    [SFX_RESEARCH]     = 0.20f,
+    [SFX_BOMB_ARM]     = 0.10f,
+    [SFX_UI_CLICK]     = 0.06f,
 };
 
 // ─── The synthesizer ──────────────────────────────────────
@@ -108,6 +131,20 @@ static void SfxInit(void) {
     sfx[SFX_CRAFT_DONE]   = SfxSynth(0.14f,  540,  900,  0.05f,  4.5f, 0.3f);
     sfx[SFX_MACHINE_FAIL] = SfxSynth(0.55f,  240,   40,  0.65f,  3.0f, 0.7f);
     sfx[SFX_PLACE]        = SfxSynth(0.10f,  200,  120,  0.60f,  8.0f, 0.6f);
+    // Guns are a hard crack: mostly hiss, pitch collapsing fast.
+    sfx[SFX_SHOT_SMALL]   = SfxSynth(0.10f,  900,  180,  0.75f,  9.0f, 0.5f);
+    sfx[SFX_SHOT_BIG]     = SfxSynth(0.26f,  520,   70,  0.88f,  5.0f, 0.6f);
+    // The laser is the opposite — almost pure tone, sliding down.
+    sfx[SFX_LASER]        = SfxSynth(0.12f, 1500,  400,  0.05f,  7.0f, 0.25f);
+    sfx[SFX_EXPLODE]      = SfxSynth(0.70f,  200,   25,  0.90f,  3.2f, 0.65f);
+    sfx[SFX_MOB_HIT]      = SfxSynth(0.07f,  380,  200,  0.55f,  9.0f, 0.6f);
+    sfx[SFX_PLAYER_DIE]   = SfxSynth(0.85f,  300,   40,  0.30f,  2.2f, 0.5f);
+    sfx[SFX_RELOAD]       = SfxSynth(0.12f,  160,  320,  0.55f,  7.0f, 0.7f);
+    // Rising and clean — the only sound in the game that goes UP and
+    // stays a tone, so an unlock reads as good news.
+    sfx[SFX_RESEARCH]     = SfxSynth(0.30f,  420,  980,  0.03f,  2.6f, 0.2f);
+    sfx[SFX_BOMB_ARM]     = SfxSynth(0.08f,  900,  700,  0.20f, 10.0f, 0.4f);
+    sfx[SFX_UI_CLICK]     = SfxSynth(0.04f, 1100,  800,  0.20f, 12.0f, 0.5f);
     for (int i = 0; i < SFX_COUNT; i++) sfxCooldown[i] = 0;
     sfxReady = true;
 }
